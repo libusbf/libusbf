@@ -1,0 +1,18 @@
+libusbf
+-------
+
+libusbf is a C library simplifying implementation of USB functions in
+userspace by encapsulating FunctionFS API. This is a device-side
+equivalent of what on host-side is libusb. It shouldn't be confused with
+libusbg library designed for USB gadget composition.
+
+For now this is proof-of-concept simple library with unstable API,
+but it allows to use most of FunctionFS functionality. It automates
+USB descriptors generation process and binds synchronous comunication.
+
+The aim is to create full featured simple in use library with synchronous
+and asynchronous communication API, fully covering FunctionFS functionality.
+
+libusbf needs Linux kernel in version 3.16+. If you can't meet this
+requirement, it should be quite simple to backport latest FunctionFS
+patches to older kernels.

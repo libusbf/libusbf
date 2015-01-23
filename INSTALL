@@ -1,0 +1,6 @@
+To install libusbf run following commands:
+
+autoreconf -i
+./configure
+make
+make install

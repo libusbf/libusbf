@@ -86,6 +86,8 @@ struct usbf_endpoint *usbf_add_endpoint(
 	if (!ep)
 		return NULL;
 
+	memcpy(&ep->desc, desc, sizeof(*desc));
+
 	func->endpoints[func->ep_count++] = ep;
 	ep->address = func->ep_count | ep->desc.direction;
 

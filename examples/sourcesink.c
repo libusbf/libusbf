@@ -65,40 +65,53 @@ int main(int argc, char *argv[])
 	};
 
 	if (argc != 2) {
-		printf("ffs directory not specified\n");
+		fprintf(stderr, "FunctionFS mountpoint not specified!\n");
 		return 1;
 	}
 
 	my_func = usbf_create_function(&f_desc, argv[1]);
-	if (!my_func)
-		printf("function registration failed\n");
+	if (!my_func) {
+		fprintf(stderr, "Function registration failed!\n");
+		return 1;
+	}
 
 	ep_desc.direction = USBF_IN;
 	ep_in = usbf_add_endpoint(my_func, &ep_desc);
-	if (!ep_in)
-		printf("can't add in endpoint\n");
+	if (!ep_in) {
+		fprintf(stderr, "Can not add in endpoint!\n");
+		ret = 1;
+		goto error;
+	}
 
 	ep_desc.direction = USBF_OUT;
 	ep_out = usbf_add_endpoint(my_func, &ep_desc);
-	if (!ep_out)
-		printf("can't add out endpoint\n");
+	if (!ep_out) {
+		fprintf(stderr, "Can not add out endpoint!\n");
+		ret = 1;
+		goto error;
+	}
 
 	ret = usbf_start(my_func);
-	if (ret < 0)
-		printf("function start failed\n");
+	if (ret < 0) {
+		fprintf(stderr, "Function start failed!\n");
+		ret = 1;
+		goto error;
+	}
 
 	for (i = 0; i < 42; ++i) {
 		usbf_handle_events(my_func);
 		ret = usbf_transfer(ep_out, buf, sizeof(buf));
 		if (ret < 0)
-			printf("can't receive data\n");
+			fprintf(stderr, "Transfer error (out)!\n");
 		ret = usbf_transfer(ep_in, buf, sizeof(buf));
 		if (ret < 0)
-			printf("can't send data\n");
+			fprintf(stderr, "Transfer error (in)!\n");
 	}
 
 	usbf_stop(my_func);
+
+error:
 	usbf_delete_function(my_func);
 
-	return 0;
+	return ret;
 }

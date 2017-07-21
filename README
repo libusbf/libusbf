@@ -10,9 +10,7 @@ For now this is proof-of-concept simple library with unstable API,
 but it allows to use most of FunctionFS functionality. It automates
 USB descriptors generation process and binds synchronous comunication.
 
-The aim is to create full featured simple in use library with synchronous
+The goal is to create full featured simple in use library with synchronous
 and asynchronous communication API, fully covering FunctionFS functionality.
 
-libusbf needs Linux kernel in version 3.16+. If you can't meet this
-requirement, it should be quite simple to backport latest FunctionFS
-patches to older kernels.
+libusbf requires Linux kernel version 3.16 or later.

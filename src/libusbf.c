@@ -28,7 +28,7 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 	if (!func)
 		return NULL;
 
-	func->ffs_path = malloc(strlen(path));
+	func->ffs_path = malloc(strlen(path) + 1);
 	if (!func->ffs_path) {
 		free(func);
 		return NULL;

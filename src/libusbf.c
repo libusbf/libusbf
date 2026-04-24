@@ -114,7 +114,7 @@ int usbf_start(struct usbf_function *func)
 
 	for (i = 0; i < descs.speeds; ++i) {
 		count_ptr = __usbf_descs_access_count(&descs, i);
-		*count_ptr = htole32(descs.endpoints+1);
+		*count_ptr = htole32(descs.endpoints + 1);
 	}
 
 	speed = 1;
@@ -171,7 +171,7 @@ int usbf_start(struct usbf_function *func)
 	__usbf_strings_set_string(&strings, func->desc.string);
 
 	/* We need space for 6 chars - 5 for "/ep##" and 1 for '\0' */
-	path = malloc(strlen(func->ffs_path)+6);
+	path = malloc(strlen(func->ffs_path) + 6);
 	if (!path) {
 		ret = -ENOMEM;
 		goto out2;
@@ -193,7 +193,7 @@ int usbf_start(struct usbf_function *func)
 		goto err;
 
 	for (i = 0; i < func->ep_count; ++i) {
-		sprintf(path, "%s/ep%d", func->ffs_path, i+1);
+		sprintf(path, "%s/ep%d", func->ffs_path, i + 1);
 		func->endpoints[i]->epfile = open(path, O_RDWR);
 		if (func->endpoints[i]->epfile < 0) {
 			ret = func->endpoints[i]->epfile;

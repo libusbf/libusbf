@@ -75,9 +75,9 @@ struct usbf_endpoint_descriptor {
 	uint16_t hs_maxpacketsize;
 	uint16_t ss_maxpacketsize;
 
-	uint8_t fs_interval;	
-	uint8_t hs_interval;	
-	uint8_t ss_interval;	
+	uint8_t fs_interval;
+	uint8_t hs_interval;
+	uint8_t ss_interval;
 
 	enum usbf_endpoint_type type;
 

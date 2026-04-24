@@ -1,7 +1,7 @@
 /*
  * Copyright (C) 2014 Robert Baldyga
  *
- * Robert Baldyga <r.baldyga@hackerion.com>
+ * Robert Baldyga <robert.baldyga@unvertical.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public

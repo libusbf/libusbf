@@ -1,4 +1,4 @@
-AC_INIT([libusbf], [0.1], [r.baldyga@hackerion.com])
+AC_INIT([libusbf], [0.1], [robert@robertbaldyga.dev])
 AM_INIT_AUTOMAKE([-Wall -Werror foreign])
 
 AC_PROG_CC

@@ -1,0 +1,20 @@
+# autotools generated
+/aclocal.m4
+/autom4te.cache/
+/config.log
+/config.status
+/configure
+/libtool
+/m4/
+Makefile
+Makefile.in
+.deps/
+.libs/
+
+# build output
+*.o
+*.lo
+*.la
+*.a
+*.so
+*.so.*

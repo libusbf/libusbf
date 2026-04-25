@@ -155,7 +155,10 @@ int usbf_start(struct usbf_function *func)
 		speed <<= 1;
 	}
 
-	/* FIXME - strings generation process is very 'simplified' for now */
+	/* Single en_US (LangID 0x0409) interface string. The strings table
+	 * format supports multiple LangIDs and multiple strings per LangID;
+	 * generalizing this requires extending usbf_function_descriptor and
+	 * the __usbf_strings layout. No current consumer needs it. */
 	strings.str_length = strlen(func->desc.string);
 	ret = __usbf_strings_alloc(&strings);
 	if (ret < 0)

@@ -18,6 +18,12 @@ AC_TYPE_UINT8_T
 # Checks for library functions.
 AC_FUNC_MALLOC
 
+# libaio for asynchronous endpoint I/O
+AC_CHECK_LIB([aio], [io_setup], [:],
+	[AC_MSG_ERROR([libaio is required (install libaio-dev)])])
+AC_CHECK_HEADER([libaio.h], [],
+	[AC_MSG_ERROR([libaio.h is required (install libaio-dev)])])
+
 AC_CONFIG_FILES([Makefile src/Makefile examples/Makefile])
 
 AC_OUTPUT

@@ -143,12 +143,12 @@ int usbf_start(struct usbf_function *func)
 			case USBF_SPEED_HS:
 				ep_desc->wMaxPacketSize =
 					htole16(ep->desc.hs_maxpacketsize);
-				ep_desc->bInterval = ep->desc.fs_interval;
+				ep_desc->bInterval = ep->desc.hs_interval;
 				break;
 			case USBF_SPEED_SS:
 				ep_desc->wMaxPacketSize =
 					htole16(ep->desc.ss_maxpacketsize);
-				ep_desc->bInterval = ep->desc.fs_interval;
+				ep_desc->bInterval = ep->desc.ss_interval;
 				break;
 			}
 		}

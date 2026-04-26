@@ -254,6 +254,7 @@ int usbf_handle_events(struct usbf_function *func)
 		ret = read(func->ep0_file, &event, sizeof(event));
 		if (ret < 0)
 			return ret;
+
 		if (event.type == FUNCTIONFS_SETUP) {
 			if (!func->desc.setup_handler) {
 				if (event.u.setup.bRequestType & USB_DIR_IN) {
@@ -274,12 +275,11 @@ int usbf_handle_events(struct usbf_function *func)
 			setup.wLength = le16toh(event.u.setup.wLength);
 			setup.function = func;
 			ret = func->desc.setup_handler(&setup);
-		} else {
-			if (func->desc.event_handler)
-				ret = func->desc.event_handler(event.type);
+		} else if (func->desc.event_handler) {
+			ret = func->desc.event_handler(event.type);
+			if (ret)
+				return ret;
 		}
-		if (ret)
-			return ret;
 	}
 	return 0;
 }

@@ -85,6 +85,7 @@ static int event_handler(enum usbf_event_type event)
 int main(int argc, char *argv[])
 {
 	struct usbf_function *my_func;
+	struct usbf_alt_setting *alt;
 	int ret;
 
 	struct usbf_function_descriptor f_desc = {
@@ -112,8 +113,15 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
+	alt = usbf_add_alt_setting(my_func);
+	if (!alt) {
+		fprintf(stderr, "Can not add alt-setting!\n");
+		ret = 1;
+		goto error;
+	}
+
 	ep_desc.direction = USBF_IN;
-	ep_in = usbf_add_endpoint(my_func, &ep_desc);
+	ep_in = usbf_add_endpoint(alt, &ep_desc);
 	if (!ep_in) {
 		fprintf(stderr, "Can not add in endpoint!\n");
 		ret = 1;
@@ -121,7 +129,7 @@ int main(int argc, char *argv[])
 	}
 
 	ep_desc.direction = USBF_OUT;
-	ep_out = usbf_add_endpoint(my_func, &ep_desc);
+	ep_out = usbf_add_endpoint(alt, &ep_desc);
 	if (!ep_out) {
 		fprintf(stderr, "Can not add out endpoint!\n");
 		ret = 1;

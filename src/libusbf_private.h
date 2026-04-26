@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: LGPL-2.1-or-later
- * Copyright (C) 2014 Robert Baldyga
+ * Copyright (C) 2014-2026 Robert Baldyga
  */
 
 #ifndef __LIBUSBF_PRIVATE_H__
@@ -15,6 +15,7 @@
 #include <libaio.h>
 
 #define MAX_ENDPOINTS		15
+#define MAX_ALT_SETTINGS	8
 #define IOCBS_PER_ENDPOINT	32
 #define MAX_INFLIGHT		(MAX_ENDPOINTS * IOCBS_PER_ENDPOINT)
 
@@ -35,12 +36,19 @@ struct usbf_endpoint {
 	struct usbf_function *func;
 };
 
+struct usbf_alt_setting {
+	struct usbf_endpoint *endpoints[MAX_ENDPOINTS];
+	int ep_count;
+	int alt_num;
+	struct usbf_function *func;
+};
+
 struct usbf_function {
 	struct usbf_function_descriptor desc;
 	char *ffs_path;
 	uint32_t flags;
-	struct usbf_endpoint *endpoints[MAX_ENDPOINTS];
-	int ep_count;
+	struct usbf_alt_setting *alts[MAX_ALT_SETTINGS];
+	int alt_count;
 	int ep0_file;
 
 	/* Event loop state, valid between usbf_start and usbf_stop. */

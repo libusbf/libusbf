@@ -12,9 +12,22 @@
 #include <string.h>
 #include <errno.h>
 
+/* Layout of the FunctionFS V2 descriptor blob this helper allocates:
+ *
+ *   [head_v2]                           <-- magic/length/flags
+ *   [count_le32] x speeds               <-- descriptor count per speed
+ *   [per-speed block] x speeds          <-- variable-sized, see below
+ *
+ * Each per-speed block is a sequence of (intf_desc + ep_desc x N) groups,
+ * one group per alt-setting, in declaration order. The total number of
+ * descriptors per speed (count_le32) is alt_count + total_eps.
+ */
+
 struct __usbf_descs {
 	int speeds;
-	int endpoints;
+	int alt_count;
+	int eps_per_alt[MAX_ALT_SETTINGS];
+	int total_eps;
 	size_t length;
 	void *data;
 };
@@ -25,13 +38,19 @@ struct __usbf_strings {
 	void *data;
 };
 
+inline size_t __usbf_descs_speed_block_size(const struct __usbf_descs *descs)
+{
+	return descs->alt_count * sizeof(struct usb_interface_descriptor) +
+		descs->total_eps *
+		sizeof(struct usb_endpoint_descriptor_no_audio);
+}
+
 inline int __usbf_descs_alloc(struct __usbf_descs *descs)
 {
 	descs->length =
-		sizeof(struct usb_functionfs_descs_head_v2) + descs->speeds *
-		(sizeof(struct usb_interface_descriptor) + descs->endpoints *
-		 sizeof(struct usb_endpoint_descriptor_no_audio) +
-		 sizeof(__le32));
+		sizeof(struct usb_functionfs_descs_head_v2) +
+		descs->speeds * sizeof(__le32) +
+		descs->speeds * __usbf_descs_speed_block_size(descs);
 	descs->data = malloc(descs->length);
 	return descs->data ? 0 : -ENOMEM;
 }
@@ -53,24 +72,15 @@ inline __le32 *__usbf_descs_access_count(struct __usbf_descs *descs, int spd_idx
 		spd_idx * sizeof(__le32);
 }
 
-inline struct usb_interface_descriptor *__usbf_descs_access_interface(
-	struct __usbf_descs *descs, int spd_idx)
+/* Returns a byte pointer to the start of spd_idx's per-speed block. The
+ * caller walks the block sequentially, writing one interface descriptor
+ * followed by its endpoint descriptors per alt-setting. */
+inline void *__usbf_descs_access_speed_block(struct __usbf_descs *descs,
+		int spd_idx)
 {
 	return descs->data + sizeof(struct usb_functionfs_descs_head_v2) +
-		descs->speeds * sizeof(__le32) + spd_idx *
-		(sizeof(struct usb_interface_descriptor) + descs->endpoints *
-		 sizeof(struct usb_endpoint_descriptor_no_audio));
-}
-
-inline struct usb_endpoint_descriptor_no_audio *__usbf_descs_access_endpoint(
-	struct __usbf_descs *descs, int spd_idx, int ep_idx)
-{
-	return descs->data + sizeof(struct usb_functionfs_descs_head_v2) +
-		descs->speeds * sizeof(__le32) + spd_idx *
-		(sizeof(struct usb_interface_descriptor) + descs->endpoints *
-		 sizeof(struct usb_endpoint_descriptor_no_audio)) +
-		sizeof(struct usb_interface_descriptor) +
-		sizeof(struct usb_endpoint_descriptor_no_audio) * ep_idx;
+		descs->speeds * sizeof(__le32) +
+		spd_idx * __usbf_descs_speed_block_size(descs);
 }
 
 inline int __usbf_strings_alloc(struct __usbf_strings *strings)

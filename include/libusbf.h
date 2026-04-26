@@ -62,6 +62,7 @@ enum usbf_event_type {
 };
 
 struct usbf_function;
+struct usbf_alt_setting;
 struct usbf_endpoint;
 
 struct usbf_setup_request {
@@ -110,8 +111,14 @@ usbf_create_function(struct usbf_function_descriptor *func, char *path);
 
 void usbf_delete_function(struct usbf_function *func);
 
+/* Add an alternate setting to the function's interface. bAlternateSetting is
+ * assigned in the order alt-settings are added: first call returns alt 0,
+ * second call alt 1, and so on. A function must have at least one alt-setting
+ * before usbf_start. */
+struct usbf_alt_setting *usbf_add_alt_setting(struct usbf_function *func);
+
 struct usbf_endpoint *usbf_add_endpoint(
-	struct usbf_function *func, struct usbf_endpoint_descriptor *desc);
+	struct usbf_alt_setting *alt, struct usbf_endpoint_descriptor *desc);
 
 int usbf_start(struct usbf_function *func);
 

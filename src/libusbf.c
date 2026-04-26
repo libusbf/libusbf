@@ -1,17 +1,6 @@
 /*
+ * SPDX-License-Identifier: LGPL-2.1-or-later
  * Copyright (C) 2014 Robert Baldyga
- *
- * Robert Baldyga <r.baldyga@hackerion.com>
- *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
  */
 
 #include "libusbf_private.h"
@@ -39,7 +28,7 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 	if (!func)
 		return NULL;
 
-	func->ffs_path = malloc(strlen(path));
+	func->ffs_path = malloc(strlen(path) + 1);
 	if (!func->ffs_path) {
 		free(func);
 		return NULL;
@@ -125,7 +114,7 @@ int usbf_start(struct usbf_function *func)
 
 	for (i = 0; i < descs.speeds; ++i) {
 		count_ptr = __usbf_descs_access_count(&descs, i);
-		*count_ptr = htole32(descs.endpoints+1);
+		*count_ptr = htole32(descs.endpoints + 1);
 	}
 
 	speed = 1;
@@ -154,19 +143,22 @@ int usbf_start(struct usbf_function *func)
 			case USBF_SPEED_HS:
 				ep_desc->wMaxPacketSize =
 					htole16(ep->desc.hs_maxpacketsize);
-				ep_desc->bInterval = ep->desc.fs_interval;
+				ep_desc->bInterval = ep->desc.hs_interval;
 				break;
 			case USBF_SPEED_SS:
 				ep_desc->wMaxPacketSize =
 					htole16(ep->desc.ss_maxpacketsize);
-				ep_desc->bInterval = ep->desc.fs_interval;
+				ep_desc->bInterval = ep->desc.ss_interval;
 				break;
 			}
 		}
 		speed <<= 1;
 	}
 
-	/* FIXME - strings generation process is very 'simplified' for now */
+	/* Single en_US (LangID 0x0409) interface string. The strings table
+	 * format supports multiple LangIDs and multiple strings per LangID;
+	 * generalizing this requires extending usbf_function_descriptor and
+	 * the __usbf_strings layout. No current consumer needs it. */
 	strings.str_length = strlen(func->desc.string);
 	ret = __usbf_strings_alloc(&strings);
 	if (ret < 0)
@@ -182,7 +174,7 @@ int usbf_start(struct usbf_function *func)
 	__usbf_strings_set_string(&strings, func->desc.string);
 
 	/* We need space for 6 chars - 5 for "/ep##" and 1 for '\0' */
-	path = malloc(strlen(func->ffs_path)+6);
+	path = malloc(strlen(func->ffs_path) + 6);
 	if (!path) {
 		ret = -ENOMEM;
 		goto out2;
@@ -204,7 +196,7 @@ int usbf_start(struct usbf_function *func)
 		goto err;
 
 	for (i = 0; i < func->ep_count; ++i) {
-		sprintf(path, "%s/ep%d", func->ffs_path, i+1);
+		sprintf(path, "%s/ep%d", func->ffs_path, i + 1);
 		func->endpoints[i]->epfile = open(path, O_RDWR);
 		if (func->endpoints[i]->epfile < 0) {
 			ret = func->endpoints[i]->epfile;
@@ -265,6 +257,7 @@ int usbf_handle_events(struct usbf_function *func)
 		ret = read(func->ep0_file, &event, sizeof(event));
 		if (ret < 0)
 			return ret;
+
 		if (event.type == FUNCTIONFS_SETUP) {
 			if (!func->desc.setup_handler) {
 				if (event.u.setup.bRequestType & USB_DIR_IN) {
@@ -285,12 +278,11 @@ int usbf_handle_events(struct usbf_function *func)
 			setup.wLength = le16toh(event.u.setup.wLength);
 			setup.function = func;
 			ret = func->desc.setup_handler(&setup);
-		} else {
-			if (func->desc.event_handler)
-				ret = func->desc.event_handler(event.type);
+		} else if (func->desc.event_handler) {
+			ret = func->desc.event_handler(event.type);
+			if (ret)
+				return ret;
 		}
-		if (ret)
-			return ret;
 	}
 	return 0;
 }

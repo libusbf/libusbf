@@ -51,7 +51,7 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 	memcpy(&func->desc, desc, sizeof(*desc));
 
 	func->flags = func->desc.speed;
-	func->alt_count = 0;
+	func->interface_count = 0;
 	func->ep0_file = -1;
 	func->epoll_fd = -1;
 	func->event_fd = -1;
@@ -69,23 +69,50 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 
 void usbf_delete_function(struct usbf_function *func)
 {
-	int a, e;
+	int i, a, e;
 
-	for (a = 0; a < func->alt_count; ++a) {
-		struct usbf_alt_setting *alt = func->alts[a];
-		for (e = 0; e < alt->ep_count; ++e)
-			free(alt->endpoints[e]);
-		free(alt);
+	for (i = 0; i < func->interface_count; ++i) {
+		struct usbf_interface *intf = func->interfaces[i];
+		for (a = 0; a < intf->alt_count; ++a) {
+			struct usbf_alt_setting *alt = intf->alts[a];
+			for (e = 0; e < alt->ep_count; ++e)
+				free(alt->endpoints[e]);
+			free(alt);
+		}
+		free(intf);
 	}
 	free(func->ffs_path);
 	free(func);
 }
 
-struct usbf_alt_setting *usbf_add_alt_setting(struct usbf_function *func)
+struct usbf_interface *
+usbf_add_interface(struct usbf_function *func,
+                   struct usbf_interface_descriptor *desc)
+{
+	struct usbf_interface *intf;
+
+	if (func->interface_count >= MAX_INTERFACES)
+		return NULL;
+
+	intf = malloc(sizeof(*intf));
+	if (!intf)
+		return NULL;
+
+	memcpy(&intf->desc, desc, sizeof(*desc));
+	intf->alt_count = 0;
+	intf->intf_num = func->interface_count;
+	intf->string_idx = 0;
+	intf->func = func;
+
+	func->interfaces[func->interface_count++] = intf;
+	return intf;
+}
+
+struct usbf_alt_setting *usbf_add_alt_setting(struct usbf_interface *intf)
 {
 	struct usbf_alt_setting *alt;
 
-	if (func->alt_count >= MAX_ALT_SETTINGS)
+	if (intf->alt_count >= MAX_ALT_SETTINGS)
 		return NULL;
 
 	alt = malloc(sizeof(*alt));
@@ -93,20 +120,25 @@ struct usbf_alt_setting *usbf_add_alt_setting(struct usbf_function *func)
 		return NULL;
 
 	alt->ep_count = 0;
-	alt->alt_num = func->alt_count;
-	alt->func = func;
+	alt->alt_num = intf->alt_count;
+	alt->intf = intf;
 
-	func->alts[func->alt_count++] = alt;
+	intf->alts[intf->alt_count++] = alt;
 
 	return alt;
 }
 
-/* Returns the total number of endpoints declared across all alt-settings. */
+/* Returns the total number of endpoints declared across all interfaces and
+ * their alt-settings. Used to assign sequential ep numbers (FFS allocates one
+ * epfile per declared endpoint, in the order they appear in the descriptors). */
 static int total_ep_count(const struct usbf_function *func)
 {
-	int a, n = 0;
-	for (a = 0; a < func->alt_count; ++a)
-		n += func->alts[a]->ep_count;
+	int i, a, n = 0;
+	for (i = 0; i < func->interface_count; ++i) {
+		const struct usbf_interface *intf = func->interfaces[i];
+		for (a = 0; a < intf->alt_count; ++a)
+			n += intf->alts[a]->ep_count;
+	}
 	return n;
 }
 
@@ -190,7 +222,7 @@ static int validate_endpoint_speed(enum usbf_endpoint_type type,
 struct usbf_endpoint *usbf_add_endpoint(
 	struct usbf_alt_setting *alt, struct usbf_endpoint_descriptor *desc)
 {
-	struct usbf_function *func = alt->func;
+	struct usbf_function *func = alt->intf->func;
 	struct usbf_endpoint *ep;
 	int ep_num;
 
@@ -236,11 +268,44 @@ struct usbf_endpoint *usbf_add_endpoint(
 	ep->epfile = -1;
 
 	alt->endpoints[alt->ep_count++] = ep;
-	/* Sequential endpoint number across all alts in declaration order. */
+	/* Sequential endpoint number across all interfaces+alts in declaration
+	 * order. */
 	ep_num = total_ep_count(func);
 	ep->address = ep_num | ep->desc.direction;
 
 	return ep;
+}
+
+/* Sum total alt-settings across all interfaces. */
+static int total_alt_count(const struct usbf_function *func)
+{
+	int i, n = 0;
+	for (i = 0; i < func->interface_count; ++i)
+		n += func->interfaces[i]->alt_count;
+	return n;
+}
+
+/* Walk interfaces and assign 1-based string indices to those that supplied a
+ * string. Returns the number of strings to emit and the total NUL-included
+ * byte length of all strings. Indices are dense (1, 2, ...) so the kernel's
+ * needed_count check (max iInterface used) lines up with str_count. */
+static void assign_string_indices(struct usbf_function *func,
+                                  int *out_count, size_t *out_bytes)
+{
+	int i, idx = 1;
+	size_t bytes = 0;
+
+	for (i = 0; i < func->interface_count; ++i) {
+		struct usbf_interface *intf = func->interfaces[i];
+		if (intf->desc.string && intf->desc.string[0] != '\0') {
+			intf->string_idx = idx++;
+			bytes += strlen(intf->desc.string) + 1;
+		} else {
+			intf->string_idx = 0;
+		}
+	}
+	*out_count = idx - 1;
+	*out_bytes = bytes;
 }
 
 int usbf_start(struct usbf_function *func)
@@ -252,27 +317,28 @@ int usbf_start(struct usbf_function *func)
 	struct usb_endpoint_descriptor_no_audio *ep_desc;
 	__le32 *count_ptr;
 	struct usb_functionfs_strings_head *strings_header;
+	struct usbf_interface *intf;
 	struct usbf_alt_setting *alt;
 	struct usbf_endpoint *ep;
 	struct epoll_event eev;
 	uint32_t speed;
 	char *path;
 	void *cur;
-	int ret, a, e, i, opened;
+	int str_count;
+	size_t str_bytes;
+	int ret, i, a, e, k, opened;
 
-	if (func->alt_count == 0)
+	if (func->interface_count == 0)
 		return -EINVAL;
+	for (i = 0; i < func->interface_count; ++i)
+		if (func->interfaces[i]->alt_count == 0)
+			return -EINVAL;
 
-	/* We count how many speeds we support */
 	descs.speeds = !!(func->flags & USBF_SPEED_FS) +
 		!!(func->flags & USBF_SPEED_HS) +
 		!!(func->flags & USBF_SPEED_SS);
-	descs.alt_count = func->alt_count;
-	descs.total_eps = 0;
-	for (a = 0; a < func->alt_count; ++a) {
-		descs.eps_per_alt[a] = func->alts[a]->ep_count;
-		descs.total_eps += func->alts[a]->ep_count;
-	}
+	descs.alt_count_total = total_alt_count(func);
+	descs.total_eps = total_ep_count(func);
 	ret = __usbf_descs_alloc(&descs);
 	if (ret)
 		return ret;
@@ -284,74 +350,97 @@ int usbf_start(struct usbf_function *func)
 	descs_header->length = htole32(descs.length);
 
 	/* count_le32 per speed = one entry per interface descriptor (one per
-	 * alt-setting) plus one per endpoint descriptor. */
+	 * (interface, alt) pair) plus one per endpoint descriptor. */
 	for (i = 0; i < descs.speeds; ++i) {
 		count_ptr = __usbf_descs_access_count(&descs, i);
-		*count_ptr = htole32(descs.alt_count + descs.total_eps);
+		*count_ptr = htole32(descs.alt_count_total + descs.total_eps);
 	}
 
+	/* String indices must be assigned before descriptor emission so each
+	 * interface descriptor can reference its iInterface slot. */
+	assign_string_indices(func, &str_count, &str_bytes);
+
 	speed = 1;
-	for (i = 0; i < descs.speeds; ++i) {
+	for (k = 0; k < descs.speeds; ++k) {
 		while (!(speed & func->flags))
 			speed <<= 1;
-		cur = __usbf_descs_access_speed_block(&descs, i);
-		for (a = 0; a < func->alt_count; ++a) {
-			alt = func->alts[a];
-			intf_desc = cur;
-			intf_desc->bLength = sizeof(*intf_desc);
-			intf_desc->bDescriptorType = USB_DT_INTERFACE;
-			intf_desc->bAlternateSetting = alt->alt_num;
-			intf_desc->bNumEndpoints = alt->ep_count;
-			intf_desc->bInterfaceClass = func->desc.interface_class;
-			intf_desc->iInterface = 1;
-			cur += sizeof(*intf_desc);
-			for (e = 0; e < alt->ep_count; ++e) {
-				ep = alt->endpoints[e];
-				ep_desc = cur;
-				ep_desc->bLength = sizeof(*ep_desc);
-				ep_desc->bDescriptorType = USB_DT_ENDPOINT;
-				ep_desc->bEndpointAddress = ep->address;
-				ep_desc->bmAttributes = ep->desc.type;
-				switch (speed) {
-				case USBF_SPEED_FS:
-					ep_desc->wMaxPacketSize =
-						htole16(ep->desc.fs_maxpacketsize);
-					ep_desc->bInterval = ep->desc.fs_interval;
-					break;
-				case USBF_SPEED_HS:
-					ep_desc->wMaxPacketSize =
-						htole16(ep->desc.hs_maxpacketsize);
-					ep_desc->bInterval = ep->desc.hs_interval;
-					break;
-				case USBF_SPEED_SS:
-					ep_desc->wMaxPacketSize =
-						htole16(ep->desc.ss_maxpacketsize);
-					ep_desc->bInterval = ep->desc.ss_interval;
-					break;
+		cur = __usbf_descs_access_speed_block(&descs, k);
+		for (i = 0; i < func->interface_count; ++i) {
+			intf = func->interfaces[i];
+			for (a = 0; a < intf->alt_count; ++a) {
+				alt = intf->alts[a];
+				intf_desc = cur;
+				intf_desc->bLength = sizeof(*intf_desc);
+				intf_desc->bDescriptorType = USB_DT_INTERFACE;
+				intf_desc->bInterfaceNumber = intf->intf_num;
+				intf_desc->bAlternateSetting = alt->alt_num;
+				intf_desc->bNumEndpoints = alt->ep_count;
+				intf_desc->bInterfaceClass =
+					intf->desc.interface_class;
+				intf_desc->iInterface = intf->string_idx;
+				cur += sizeof(*intf_desc);
+				for (e = 0; e < alt->ep_count; ++e) {
+					ep = alt->endpoints[e];
+					ep_desc = cur;
+					ep_desc->bLength = sizeof(*ep_desc);
+					ep_desc->bDescriptorType = USB_DT_ENDPOINT;
+					ep_desc->bEndpointAddress = ep->address;
+					ep_desc->bmAttributes = ep->desc.type;
+					switch (speed) {
+					case USBF_SPEED_FS:
+						ep_desc->wMaxPacketSize =
+							htole16(ep->desc.fs_maxpacketsize);
+						ep_desc->bInterval = ep->desc.fs_interval;
+						break;
+					case USBF_SPEED_HS:
+						ep_desc->wMaxPacketSize =
+							htole16(ep->desc.hs_maxpacketsize);
+						ep_desc->bInterval = ep->desc.hs_interval;
+						break;
+					case USBF_SPEED_SS:
+						ep_desc->wMaxPacketSize =
+							htole16(ep->desc.ss_maxpacketsize);
+						ep_desc->bInterval = ep->desc.ss_interval;
+						break;
+					}
+					cur += sizeof(*ep_desc);
 				}
-				cur += sizeof(*ep_desc);
 			}
 		}
 		speed <<= 1;
 	}
 
-	/* Single en_US (LangID 0x0409) interface string. The strings table
-	 * format supports multiple LangIDs and multiple strings per LangID;
-	 * generalizing this requires extending usbf_function_descriptor and
-	 * the __usbf_strings layout. No current consumer needs it. */
-	strings.str_length = strlen(func->desc.string);
+	/* Strings table: one LangID (en-US 0x0409) with str_count strings
+	 * (one per interface that supplied a non-empty string). When no
+	 * interface declared a string, str_count == 0 and the body is empty;
+	 * FFS accepts that as long as no descriptor references a string. */
+	if (str_count > 0)
+		strings.body_length = sizeof(__le16) + str_bytes;
+	else
+		strings.body_length = 0;
+	strings.str_count = str_count;
 	ret = __usbf_strings_alloc(&strings);
 	if (ret < 0)
 		goto out;
 
 	strings_header = __usbf_strings_access_header(&strings);
 	strings_header->magic = htole32(FUNCTIONFS_STRINGS_MAGIC);
-	strings_header->length = strings.length;
-	strings_header->str_count = htole32(1);
-	strings_header->lang_count = htole32(1);
+	strings_header->length = htole32(strings.length);
+	strings_header->str_count = htole32(str_count);
+	strings_header->lang_count = htole32(str_count > 0 ? 1 : 0);
 
-	__usbf_strings_set_code(&strings, htole16(0x0409));
-	__usbf_strings_set_string(&strings, func->desc.string);
+	if (str_count > 0) {
+		char *body = __usbf_strings_body(&strings);
+		*(__le16 *)body = htole16(0x0409);
+		body += sizeof(__le16);
+		for (i = 0; i < func->interface_count; ++i) {
+			struct usbf_interface *p = func->interfaces[i];
+			if (p->string_idx == 0)
+				continue;
+			strcpy(body, p->desc.string);
+			body += strlen(p->desc.string) + 1;
+		}
+	}
 
 	/* We need space for 6 chars - 5 for "/ep##" and 1 for '\0' */
 	path = malloc(strlen(func->ffs_path) + 6);
@@ -376,16 +465,19 @@ int usbf_start(struct usbf_function *func)
 		goto err;
 
 	opened = 0;
-	for (a = 0; a < func->alt_count; ++a) {
-		alt = func->alts[a];
-		for (e = 0; e < alt->ep_count; ++e) {
-			sprintf(path, "%s/ep%d", func->ffs_path, opened + 1);
-			alt->endpoints[e]->epfile = open(path, O_RDWR);
-			if (alt->endpoints[e]->epfile < 0) {
-				ret = alt->endpoints[e]->epfile;
-				goto err_epfiles;
+	for (i = 0; i < func->interface_count; ++i) {
+		intf = func->interfaces[i];
+		for (a = 0; a < intf->alt_count; ++a) {
+			alt = intf->alts[a];
+			for (e = 0; e < alt->ep_count; ++e) {
+				sprintf(path, "%s/ep%d", func->ffs_path, opened + 1);
+				alt->endpoints[e]->epfile = open(path, O_RDWR);
+				if (alt->endpoints[e]->epfile < 0) {
+					ret = alt->endpoints[e]->epfile;
+					goto err_epfiles;
+				}
+				++opened;
 			}
-			++opened;
 		}
 	}
 
@@ -432,12 +524,15 @@ err_aio:
 	io_destroy(func->aio_ctx);
 	func->aio_ctx = 0;
 err_epfiles:
-	for (a = 0; a < func->alt_count && opened > 0; ++a) {
-		alt = func->alts[a];
-		for (e = 0; e < alt->ep_count && opened > 0; ++e) {
-			close(alt->endpoints[e]->epfile);
-			alt->endpoints[e]->epfile = -1;
-			--opened;
+	for (i = 0; i < func->interface_count && opened > 0; ++i) {
+		intf = func->interfaces[i];
+		for (a = 0; a < intf->alt_count && opened > 0; ++a) {
+			alt = intf->alts[a];
+			for (e = 0; e < alt->ep_count && opened > 0; ++e) {
+				close(alt->endpoints[e]->epfile);
+				alt->endpoints[e]->epfile = -1;
+				--opened;
+			}
 		}
 	}
 err:
@@ -454,7 +549,7 @@ out:
 
 void usbf_stop(struct usbf_function *func)
 {
-	int a, e;
+	int i, a, e;
 
 	func->running = 0;
 
@@ -471,12 +566,15 @@ void usbf_stop(struct usbf_function *func)
 		func->aio_ctx = 0;
 	}
 
-	for (a = 0; a < func->alt_count; ++a) {
-		struct usbf_alt_setting *alt = func->alts[a];
-		for (e = 0; e < alt->ep_count; ++e) {
-			if (alt->endpoints[e]->epfile >= 0) {
-				close(alt->endpoints[e]->epfile);
-				alt->endpoints[e]->epfile = -1;
+	for (i = 0; i < func->interface_count; ++i) {
+		struct usbf_interface *intf = func->interfaces[i];
+		for (a = 0; a < intf->alt_count; ++a) {
+			struct usbf_alt_setting *alt = intf->alts[a];
+			for (e = 0; e < alt->ep_count; ++e) {
+				if (alt->endpoints[e]->epfile >= 0) {
+					close(alt->endpoints[e]->epfile);
+					alt->endpoints[e]->epfile = -1;
+				}
 			}
 		}
 	}

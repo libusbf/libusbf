@@ -62,6 +62,7 @@ enum usbf_event_type {
 };
 
 struct usbf_function;
+struct usbf_interface;
 struct usbf_alt_setting;
 struct usbf_endpoint;
 
@@ -89,10 +90,14 @@ struct usbf_endpoint_descriptor {
 	enum usbf_endpoint_direction direction;
 };
 
+struct usbf_interface_descriptor {
+	uint8_t interface_class;
+	/* en-US interface name; NULL leaves iInterface = 0. */
+	char *string;
+};
+
 struct usbf_function_descriptor {
 	uint32_t speed;
-	uint8_t interface_class;
-	char *string; /* TODO - USB strings handling */
 	int (*event_handler)(enum usbf_event_type);
 	int (*setup_handler)(const struct usbf_setup_request *);
 };
@@ -111,11 +116,17 @@ usbf_create_function(struct usbf_function_descriptor *func, char *path);
 
 void usbf_delete_function(struct usbf_function *func);
 
-/* Add an alternate setting to the function's interface. bAlternateSetting is
- * assigned in the order alt-settings are added: first call returns alt 0,
- * second call alt 1, and so on. A function must have at least one alt-setting
- * before usbf_start. */
-struct usbf_alt_setting *usbf_add_alt_setting(struct usbf_function *func);
+/* Add an interface to the function. bInterfaceNumber is assigned in the order
+ * interfaces are added: first call returns interface 0, second returns 1, and
+ * so on. A function must have at least one interface (with at least one
+ * alt-setting) before usbf_start. */
+struct usbf_interface *
+usbf_add_interface(struct usbf_function *func,
+                   struct usbf_interface_descriptor *desc);
+
+/* Add an alternate setting to an interface. bAlternateSetting is assigned in
+ * the order alt-settings are added on that interface. */
+struct usbf_alt_setting *usbf_add_alt_setting(struct usbf_interface *intf);
 
 struct usbf_endpoint *usbf_add_endpoint(
 	struct usbf_alt_setting *alt, struct usbf_endpoint_descriptor *desc);

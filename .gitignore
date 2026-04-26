@@ -8,6 +8,7 @@
 /m4/
 Makefile
 Makefile.in
+!tests/gadgets/Makefile
 .deps/
 .libs/
 

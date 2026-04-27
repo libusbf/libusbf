@@ -25,15 +25,16 @@
 struct usbf_function *
 usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 {
+	const uint32_t speed_mask = USBF_SPEED_FS | USBF_SPEED_HS | USBF_SPEED_SS;
 	struct usbf_function *func;
 	int i;
 
 	if (!desc || !path)
 		return NULL;
 
-	if (desc->speed & ~(0x07))
+	if (desc->speed & ~speed_mask)
 		return NULL;
-	if (!(desc->speed & 0x07))
+	if (!(desc->speed & speed_mask))
 		return NULL;
 
 	func = malloc(sizeof(*func));

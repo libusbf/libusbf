@@ -268,6 +268,15 @@ int usbf_clear_halt(struct usbf_endpoint *ep);
 struct usbf_endpoint *
 usbf_find_endpoint(struct usbf_function *func, uint8_t number);
 
+/* Query the negotiated bus speed of the function. Returns one of
+ * USBF_SPEED_FS, USBF_SPEED_HS, or USBF_SPEED_SS. Returns 0 when the
+ * function is not enumerated, the UDC's speed is undetermined, or more
+ * than one UDC on the system is currently negotiated (libusbf cannot
+ * tell which one belongs to this function from the FFS path alone).
+ * Reads current_speed from sysfs on each call so it tracks reconnects
+ * and reset transitions. */
+int usbf_get_speed(struct usbf_function *func);
+
 /* ep0 setup-request helpers (called from setup_handler). */
 int usbf_setup_ack(const struct usbf_setup_request *setup);
 

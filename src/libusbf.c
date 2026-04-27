@@ -18,6 +18,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <dirent.h>
 
 /* epoll .data.u32 tags for the two fds we watch */
 #define TAG_EP0	0
@@ -923,6 +924,62 @@ usbf_find_endpoint(struct usbf_function *func, uint8_t number)
 		}
 	}
 	return NULL;
+}
+
+static int parse_udc_speed(const char *s)
+{
+	if (!strcmp(s, "low-speed") || !strcmp(s, "full-speed"))
+		return USBF_SPEED_FS;
+	if (!strcmp(s, "high-speed"))
+		return USBF_SPEED_HS;
+	if (!strcmp(s, "super-speed") || !strcmp(s, "super-speed-plus"))
+		return USBF_SPEED_SS;
+	return 0;
+}
+
+int usbf_get_speed(struct usbf_function *func)
+{
+	DIR *dir;
+	struct dirent *ent;
+	int found = 0;
+	int speed = 0;
+
+	(void)func;
+
+	dir = opendir("/sys/class/udc");
+	if (!dir)
+		return 0;
+
+	while ((ent = readdir(dir)) != NULL) {
+		char path[PATH_MAX];
+		char buf[32];
+		int fd, n, s;
+
+		if (ent->d_name[0] == '.')
+			continue;
+
+		snprintf(path, sizeof(path),
+			 "/sys/class/udc/%s/current_speed", ent->d_name);
+		fd = open(path, O_RDONLY);
+		if (fd < 0)
+			continue;
+		n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n <= 0)
+			continue;
+		while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == ' '))
+			--n;
+		buf[n] = '\0';
+
+		s = parse_udc_speed(buf);
+		if (s != 0) {
+			++found;
+			speed = s;
+		}
+	}
+	closedir(dir);
+
+	return found == 1 ? speed : 0;
 }
 
 static int drain_ep0_events(struct usbf_function *func)

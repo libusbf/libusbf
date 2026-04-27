@@ -516,7 +516,17 @@ int usbf_setup_response(const struct usbf_setup_request *setup,
 
 int usbf_setup_stall(const struct usbf_setup_request *setup)
 {
-	return (setup->bRequestType & USB_DIR_IN) ?
-		read(setup->function->ep0_file, NULL, 0) :
-		write(setup->function->ep0_file, NULL, 0);
+	ssize_t r;
+
+	/* Wrong-direction zero-length transfer triggers a stall: read on an
+	 * IN setup or write on an OUT setup. FFS reports stall-success via
+	 * errno = EL2HLT (the kernel ack — see __ffs_ep0_stall in f_fs.c),
+	 * so swallow that and return 0; any other negative is fatal. */
+	if (setup->bRequestType & USB_DIR_IN)
+		r = read(setup->function->ep0_file, NULL, 0);
+	else
+		r = write(setup->function->ep0_file, NULL, 0);
+	if (r < 0 && errno != EL2HLT)
+		return -errno;
+	return 0;
 }

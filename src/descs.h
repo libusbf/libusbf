@@ -18,18 +18,24 @@
  *   [count_le32] x speeds               <-- descriptor count per speed
  *   [per-speed block] x speeds          <-- variable-sized, see below
  *
- * Each per-speed block is a sequence of (intf_desc + ep_desc x N) groups,
- * one group per (interface, alt-setting) pair, in declaration order. The
- * total number of descriptors per speed (count_le32) is alt_count_total +
- * total_eps, where alt_count_total sums alts across all interfaces.
+ * Each per-speed block is a sequence of (intf_desc + class_descs + ep_desc
+ * x N) groups, one group per (interface, alt-setting) pair, in declaration
+ * order. The SS speed block additionally emits a 6-byte SS endpoint
+ * companion descriptor after each endpoint descriptor, so its block size
+ * and descriptor count differ from FS/HS - that's why per-speed sizes and
+ * counts are tracked individually rather than collapsed into a single
+ * shared value.
+ *
+ * The caller fills per_speed_size[] and per_speed_count[] (one entry per
+ * declared speed, in order) before calling __usbf_descs_alloc.
  */
+
+#define USBF_MAX_SPEEDS 3
 
 struct __usbf_descs {
 	int speeds;
-	int alt_count_total;
-	int total_eps;
-	int total_class_descs;
-	size_t class_descs_bytes;
+	size_t per_speed_size[USBF_MAX_SPEEDS];
+	int per_speed_count[USBF_MAX_SPEEDS];
 	size_t length;
 	void *data;
 };
@@ -55,21 +61,13 @@ struct __usbf_strings {
 	void *data;
 };
 
-inline size_t __usbf_descs_speed_block_size(const struct __usbf_descs *descs)
-{
-	return descs->alt_count_total *
-		sizeof(struct usb_interface_descriptor) +
-		descs->class_descs_bytes +
-		descs->total_eps *
-		sizeof(struct usb_endpoint_descriptor_no_audio);
-}
-
 inline int __usbf_descs_alloc(struct __usbf_descs *descs)
 {
-	descs->length =
-		sizeof(struct usb_functionfs_descs_head_v2) +
-		descs->speeds * sizeof(__le32) +
-		descs->speeds * __usbf_descs_speed_block_size(descs);
+	int i;
+	descs->length = sizeof(struct usb_functionfs_descs_head_v2) +
+		descs->speeds * sizeof(__le32);
+	for (i = 0; i < descs->speeds; ++i)
+		descs->length += descs->per_speed_size[i];
 	descs->data = malloc(descs->length);
 	return descs->data ? 0 : -ENOMEM;
 }
@@ -93,13 +91,18 @@ inline __le32 *__usbf_descs_access_count(struct __usbf_descs *descs, int spd_idx
 
 /* Returns a byte pointer to the start of spd_idx's per-speed block. The
  * caller walks the block sequentially, writing one interface descriptor
- * followed by its endpoint descriptors per (interface, alt) pair. */
+ * followed by its class-specific descriptors and endpoint descriptors per
+ * (interface, alt) pair. For SS, an SS endpoint companion descriptor is
+ * appended after each endpoint descriptor. */
 inline void *__usbf_descs_access_speed_block(struct __usbf_descs *descs,
 		int spd_idx)
 {
-	return descs->data + sizeof(struct usb_functionfs_descs_head_v2) +
-		descs->speeds * sizeof(__le32) +
-		spd_idx * __usbf_descs_speed_block_size(descs);
+	size_t off = sizeof(struct usb_functionfs_descs_head_v2) +
+		descs->speeds * sizeof(__le32);
+	int i;
+	for (i = 0; i < spd_idx; ++i)
+		off += descs->per_speed_size[i];
+	return descs->data + off;
 }
 
 inline int __usbf_strings_alloc(struct __usbf_strings *strings)

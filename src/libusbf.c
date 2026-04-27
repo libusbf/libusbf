@@ -256,6 +256,41 @@ static int validate_endpoint_speed(enum usbf_endpoint_type type,
 	return 0;
 }
 
+/* SS endpoint companion descriptor sanity:
+ *   bMaxBurst:           0..15 always.
+ *   bmAttributes:        bulk encodes the max-streams exponent in bits[4:0]
+ *                        (so bits[7:5] are reserved); isoc encodes Mult in
+ *                        bits[1:0] with Mult <= 2 and bits[7:2] reserved;
+ *                        interrupt has the whole byte reserved.
+ *   wBytesPerInterval:   bulk MUST be 0 per spec; periodic eps reserve
+ *                        bandwidth so any non-zero value is allowed. */
+static int validate_ss_companion(enum usbf_endpoint_type type,
+                                 const struct usbf_endpoint_descriptor *desc)
+{
+	if (desc->ss_max_burst > 15)
+		return -EINVAL;
+
+	switch (type) {
+	case USBF_BULK:
+		if (desc->ss_attributes & 0xe0)
+			return -EINVAL;
+		if (desc->ss_bytes_per_interval != 0)
+			return -EINVAL;
+		break;
+	case USBF_INTERRUPT:
+		if (desc->ss_attributes != 0)
+			return -EINVAL;
+		break;
+	case USBF_ISOCHRONOUS:
+		if (desc->ss_attributes & 0xfc)
+			return -EINVAL;
+		if ((desc->ss_attributes & 0x03) > 2)
+			return -EINVAL;
+		break;
+	}
+	return 0;
+}
+
 struct usbf_endpoint *usbf_add_endpoint(
 	struct usbf_alt_setting *alt, struct usbf_endpoint_descriptor *desc)
 {
@@ -285,11 +320,15 @@ struct usbf_endpoint *usbf_add_endpoint(
 	                            desc->hs_maxpacketsize,
 	                            desc->hs_interval, USBF_SPEED_HS) < 0)
 		return NULL;
-	if ((func->desc.speed & USBF_SPEED_SS) &&
-	    validate_endpoint_speed(desc->type,
-	                            desc->ss_maxpacketsize,
-	                            desc->ss_interval, USBF_SPEED_SS) < 0)
-		return NULL;
+	if (func->desc.speed & USBF_SPEED_SS) {
+		if (validate_endpoint_speed(desc->type,
+		                            desc->ss_maxpacketsize,
+		                            desc->ss_interval,
+		                            USBF_SPEED_SS) < 0)
+			return NULL;
+		if (validate_ss_companion(desc->type, desc) < 0)
+			return NULL;
+	}
 
 	if (alt->ep_count >= MAX_ENDPOINTS)
 		return NULL;
@@ -391,13 +430,44 @@ int usbf_start(struct usbf_function *func)
 		if (func->interfaces[i]->alt_count == 0)
 			return -EINVAL;
 
-	descs.speeds = !!(func->flags & USBF_SPEED_FS) +
-		!!(func->flags & USBF_SPEED_HS) +
-		!!(func->flags & USBF_SPEED_SS);
-	descs.alt_count_total = total_alt_count(func);
-	descs.total_eps = total_ep_count(func);
-	total_class_descs(func, &descs.total_class_descs,
-	                  &descs.class_descs_bytes);
+	{
+		int alts = total_alt_count(func);
+		int eps = total_ep_count(func);
+		int n_class;
+		size_t class_bytes;
+		size_t base_size;
+		int base_count;
+		uint32_t s;
+		int idx = 0;
+
+		total_class_descs(func, &n_class, &class_bytes);
+
+		/* All speeds share the same interface descriptors, class
+		 * descriptors, and endpoint descriptors. SS additionally
+		 * appends a 6-byte SS companion after each endpoint. */
+		base_size = alts * sizeof(struct usb_interface_descriptor) +
+			class_bytes +
+			eps * sizeof(struct usb_endpoint_descriptor_no_audio);
+		base_count = alts + n_class + eps;
+
+		descs.speeds = !!(func->flags & USBF_SPEED_FS) +
+			!!(func->flags & USBF_SPEED_HS) +
+			!!(func->flags & USBF_SPEED_SS);
+
+		for (s = USBF_SPEED_FS; s <= USBF_SPEED_SS; s <<= 1) {
+			if (!(func->flags & s))
+				continue;
+			descs.per_speed_size[idx] = base_size;
+			descs.per_speed_count[idx] = base_count;
+			if (s == USBF_SPEED_SS) {
+				descs.per_speed_size[idx] += eps *
+					sizeof(struct usb_ss_ep_comp_descriptor);
+				descs.per_speed_count[idx] += eps;
+			}
+			++idx;
+		}
+	}
+
 	ret = __usbf_descs_alloc(&descs);
 	if (ret)
 		return ret;
@@ -408,14 +478,9 @@ int usbf_start(struct usbf_function *func)
 	descs_header->flags = htole32(func->flags);
 	descs_header->length = htole32(descs.length);
 
-	/* count_le32 per speed = one entry per interface descriptor (one per
-	 * (interface, alt) pair) plus one per class-specific descriptor plus
-	 * one per endpoint descriptor. */
 	for (i = 0; i < descs.speeds; ++i) {
 		count_ptr = __usbf_descs_access_count(&descs, i);
-		*count_ptr = htole32(descs.alt_count_total +
-		                     descs.total_class_descs +
-		                     descs.total_eps);
+		*count_ptr = htole32(descs.per_speed_count[i]);
 	}
 
 	/* String indices must be assigned before descriptor emission so each
@@ -480,6 +545,18 @@ int usbf_start(struct usbf_function *func)
 						break;
 					}
 					cur += sizeof(*ep_desc);
+					/* SS companion follows every endpoint
+					 * descriptor in the SS speed block. */
+					if (speed == USBF_SPEED_SS) {
+						struct usb_ss_ep_comp_descriptor *comp = cur;
+						comp->bLength = sizeof(*comp);
+						comp->bDescriptorType = USB_DT_SS_ENDPOINT_COMP;
+						comp->bMaxBurst = ep->desc.ss_max_burst;
+						comp->bmAttributes = ep->desc.ss_attributes;
+						comp->wBytesPerInterval =
+							htole16(ep->desc.ss_bytes_per_interval);
+						cur += sizeof(*comp);
+					}
 				}
 			}
 		}

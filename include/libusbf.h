@@ -85,6 +85,25 @@ struct usbf_endpoint_descriptor {
 	uint8_t hs_interval;
 	uint8_t ss_interval;
 
+	/* SuperSpeed endpoint companion fields. Used only when the function
+	 * declares USBF_SPEED_SS; ignored otherwise. The default-zero values
+	 * describe the simplest valid SS endpoint: no burst, no streams (bulk),
+	 * single packet per service interval (periodic).
+	 *
+	 *   ss_max_burst:           bMaxBurst, 0..15. 0 means "single packet
+	 *                           per interval".
+	 *   ss_attributes:          raw bmAttributes byte. Bulk: bits[4:0] are
+	 *                           the max-streams exponent (0 = no streams,
+	 *                           N = 2^N streams). Isoc: bits[1:0] are Mult
+	 *                           (0..2). Interrupt: reserved (must be 0).
+	 *   ss_bytes_per_interval:  wBytesPerInterval. Periodic eps reserve
+	 *                           bus bandwidth based on this value (typically
+	 *                           mps * (mult+1) * (max_burst+1)). Bulk
+	 *                           endpoints MUST set this to 0 per spec. */
+	uint8_t ss_max_burst;
+	uint8_t ss_attributes;
+	uint16_t ss_bytes_per_interval;
+
 	enum usbf_endpoint_type type;
 
 	enum usbf_endpoint_direction direction;

@@ -17,6 +17,7 @@
 #define MAX_ENDPOINTS		15
 #define MAX_ALT_SETTINGS	8
 #define MAX_INTERFACES		8
+#define MAX_CLASS_DESCS		4
 #define IOCBS_PER_ENDPOINT	32
 #define MAX_INFLIGHT		(MAX_ENDPOINTS * IOCBS_PER_ENDPOINT)
 
@@ -37,10 +38,17 @@ struct usbf_endpoint {
 	struct usbf_function *func;
 };
 
+struct usbf_class_descriptor {
+	void *data;
+	size_t length;
+};
+
 struct usbf_alt_setting {
 	struct usbf_endpoint *endpoints[MAX_ENDPOINTS];
 	int ep_count;
 	int alt_num;
+	struct usbf_class_descriptor *class_descs[MAX_CLASS_DESCS];
+	int class_desc_count;
 	struct usbf_interface *intf;
 };
 

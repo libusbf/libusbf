@@ -28,6 +28,8 @@ struct __usbf_descs {
 	int speeds;
 	int alt_count_total;
 	int total_eps;
+	int total_class_descs;
+	size_t class_descs_bytes;
 	size_t length;
 	void *data;
 };
@@ -57,6 +59,7 @@ inline size_t __usbf_descs_speed_block_size(const struct __usbf_descs *descs)
 {
 	return descs->alt_count_total *
 		sizeof(struct usb_interface_descriptor) +
+		descs->class_descs_bytes +
 		descs->total_eps *
 		sizeof(struct usb_endpoint_descriptor_no_audio);
 }

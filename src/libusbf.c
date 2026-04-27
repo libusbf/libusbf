@@ -69,12 +69,16 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 
 void usbf_delete_function(struct usbf_function *func)
 {
-	int i, a, e;
+	int i, a, e, c;
 
 	for (i = 0; i < func->interface_count; ++i) {
 		struct usbf_interface *intf = func->interfaces[i];
 		for (a = 0; a < intf->alt_count; ++a) {
 			struct usbf_alt_setting *alt = intf->alts[a];
+			for (c = 0; c < alt->class_desc_count; ++c) {
+				free(alt->class_descs[c]->data);
+				free(alt->class_descs[c]);
+			}
 			for (e = 0; e < alt->ep_count; ++e)
 				free(alt->endpoints[e]);
 			free(alt);
@@ -120,12 +124,45 @@ struct usbf_alt_setting *usbf_add_alt_setting(struct usbf_interface *intf)
 		return NULL;
 
 	alt->ep_count = 0;
+	alt->class_desc_count = 0;
 	alt->alt_num = intf->alt_count;
 	alt->intf = intf;
 
 	intf->alts[intf->alt_count++] = alt;
 
 	return alt;
+}
+
+int usbf_add_class_descriptor(struct usbf_alt_setting *alt,
+                              const void *data, size_t length)
+{
+	struct usbf_class_descriptor *cd;
+
+	/* USB descriptors carry their own length in the first byte; the blob
+	 * passed here is one descriptor, so bLength must equal the byte
+	 * count. Single-byte descriptors don't exist (every descriptor type
+	 * has at least bLength + bDescriptorType), and bLength is uint8 so
+	 * 255 bytes is the upper bound. */
+	if (length < 2 || length > 255)
+		return -EINVAL;
+	if (((const uint8_t *)data)[0] != length)
+		return -EINVAL;
+	if (alt->class_desc_count >= MAX_CLASS_DESCS)
+		return -ENOSPC;
+
+	cd = malloc(sizeof(*cd));
+	if (!cd)
+		return -ENOMEM;
+	cd->data = malloc(length);
+	if (!cd->data) {
+		free(cd);
+		return -ENOMEM;
+	}
+	memcpy(cd->data, data, length);
+	cd->length = length;
+
+	alt->class_descs[alt->class_desc_count++] = cd;
+	return 0;
 }
 
 /* Returns the total number of endpoints declared across all interfaces and
@@ -285,6 +322,26 @@ static int total_alt_count(const struct usbf_function *func)
 	return n;
 }
 
+/* Walk every alt and accumulate class-descriptor counts and byte size. */
+static void total_class_descs(const struct usbf_function *func,
+                              int *out_count, size_t *out_bytes)
+{
+	int i, a, c, count = 0;
+	size_t bytes = 0;
+	for (i = 0; i < func->interface_count; ++i) {
+		const struct usbf_interface *intf = func->interfaces[i];
+		for (a = 0; a < intf->alt_count; ++a) {
+			const struct usbf_alt_setting *alt = intf->alts[a];
+			for (c = 0; c < alt->class_desc_count; ++c) {
+				++count;
+				bytes += alt->class_descs[c]->length;
+			}
+		}
+	}
+	*out_count = count;
+	*out_bytes = bytes;
+}
+
 /* Walk interfaces and assign 1-based string indices to those that supplied a
  * string. Returns the number of strings to emit and the total NUL-included
  * byte length of all strings. Indices are dense (1, 2, ...) so the kernel's
@@ -339,6 +396,8 @@ int usbf_start(struct usbf_function *func)
 		!!(func->flags & USBF_SPEED_SS);
 	descs.alt_count_total = total_alt_count(func);
 	descs.total_eps = total_ep_count(func);
+	total_class_descs(func, &descs.total_class_descs,
+	                  &descs.class_descs_bytes);
 	ret = __usbf_descs_alloc(&descs);
 	if (ret)
 		return ret;
@@ -350,10 +409,13 @@ int usbf_start(struct usbf_function *func)
 	descs_header->length = htole32(descs.length);
 
 	/* count_le32 per speed = one entry per interface descriptor (one per
-	 * (interface, alt) pair) plus one per endpoint descriptor. */
+	 * (interface, alt) pair) plus one per class-specific descriptor plus
+	 * one per endpoint descriptor. */
 	for (i = 0; i < descs.speeds; ++i) {
 		count_ptr = __usbf_descs_access_count(&descs, i);
-		*count_ptr = htole32(descs.alt_count_total + descs.total_eps);
+		*count_ptr = htole32(descs.alt_count_total +
+		                     descs.total_class_descs +
+		                     descs.total_eps);
 	}
 
 	/* String indices must be assigned before descriptor emission so each
@@ -368,6 +430,7 @@ int usbf_start(struct usbf_function *func)
 		for (i = 0; i < func->interface_count; ++i) {
 			intf = func->interfaces[i];
 			for (a = 0; a < intf->alt_count; ++a) {
+				int c;
 				alt = intf->alts[a];
 				intf_desc = cur;
 				intf_desc->bLength = sizeof(*intf_desc);
@@ -377,8 +440,21 @@ int usbf_start(struct usbf_function *func)
 				intf_desc->bNumEndpoints = alt->ep_count;
 				intf_desc->bInterfaceClass =
 					intf->desc.interface_class;
+				intf_desc->bInterfaceSubClass =
+					intf->desc.interface_subclass;
+				intf_desc->bInterfaceProtocol =
+					intf->desc.interface_protocol;
 				intf_desc->iInterface = intf->string_idx;
 				cur += sizeof(*intf_desc);
+				/* Class-specific descriptors (e.g. HID, CCID,
+				 * DFU functional) sit between the interface
+				 * descriptor and its endpoint descriptors. */
+				for (c = 0; c < alt->class_desc_count; ++c) {
+					struct usbf_class_descriptor *cd =
+						alt->class_descs[c];
+					memcpy(cur, cd->data, cd->length);
+					cur += cd->length;
+				}
 				for (e = 0; e < alt->ep_count; ++e) {
 					ep = alt->endpoints[e];
 					ep_desc = cur;

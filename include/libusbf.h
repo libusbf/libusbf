@@ -90,8 +90,19 @@ struct usbf_endpoint_descriptor {
 	enum usbf_endpoint_direction direction;
 };
 
+/* Class/subclass/protocol live on the USB interface descriptor, which is
+ * emitted once per (interface, alt-setting) pair, so the spec technically
+ * permits them to vary across alts of the same interface.  In practice this
+ * is essentially never done (UAC bandwidth profiles, UVC streaming, HID
+ * variants all keep class/subclass/protocol pinned per interface and only
+ * vary endpoint shape), so libusbf attaches them at the interface level and
+ * applies the same triple to every alt of that interface.  If a per-alt
+ * override is ever needed, it can be added as an optional field on the
+ * alt-setting layer without breaking this API. */
 struct usbf_interface_descriptor {
 	uint8_t interface_class;
+	uint8_t interface_subclass;
+	uint8_t interface_protocol;
 	/* en-US interface name; NULL leaves iInterface = 0. */
 	char *string;
 };
@@ -130,6 +141,16 @@ struct usbf_alt_setting *usbf_add_alt_setting(struct usbf_interface *intf);
 
 struct usbf_endpoint *usbf_add_endpoint(
 	struct usbf_alt_setting *alt, struct usbf_endpoint_descriptor *desc);
+
+/* Append one class-specific descriptor (e.g. HID, CCID, DFU functional) to
+ * an alt-setting. The bytes are emitted between the alt's interface
+ * descriptor and its endpoint descriptors, in the order added; `data[0]`
+ * is bLength and must equal `length`. Call once per descriptor.
+ *
+ * libusbf copies the bytes immediately, so `data` need not outlive this
+ * call. Returns 0 on success or a negative errno on failure. */
+int usbf_add_class_descriptor(struct usbf_alt_setting *alt,
+                              const void *data, size_t length);
 
 int usbf_start(struct usbf_function *func);
 

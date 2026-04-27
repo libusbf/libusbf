@@ -55,6 +55,8 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 
 	func->flags = func->desc.speed;
 	func->interface_count = 0;
+	func->has_iad = 0;
+	func->iad_string_idx = 0;
 	func->ep0_file = -1;
 	func->epoll_fd = -1;
 	func->event_fd = -1;
@@ -92,6 +94,16 @@ void usbf_delete_function(struct usbf_function *func)
 	}
 	free(func->ffs_path);
 	free(func);
+}
+
+int usbf_set_iad(struct usbf_function *func,
+                 struct usbf_iad_descriptor *desc)
+{
+	if (!func || !desc)
+		return -EINVAL;
+	memcpy(&func->iad_desc, desc, sizeof(*desc));
+	func->has_iad = 1;
+	return 0;
 }
 
 struct usbf_interface *
@@ -386,15 +398,25 @@ static void total_class_descs(const struct usbf_function *func,
 	*out_bytes = bytes;
 }
 
-/* Walk interfaces and assign 1-based string indices to those that supplied a
- * string. Returns the number of strings to emit and the total NUL-included
- * byte length of all strings. Indices are dense (1, 2, ...) so the kernel's
- * needed_count check (max iInterface used) lines up with str_count. */
+/* Walk the function and assign 1-based string indices to every descriptor
+ * that supplied a non-empty string (IAD's iFunction, then each interface's
+ * iInterface in declaration order). Returns the number of strings to emit
+ * and the total NUL-included byte length of all strings. Indices are dense
+ * (1, 2, ...) so the kernel's needed_count check (max string idx used) lines
+ * up with str_count. */
 static void assign_string_indices(struct usbf_function *func,
                                   int *out_count, size_t *out_bytes)
 {
 	int i, idx = 1;
 	size_t bytes = 0;
+
+	if (func->has_iad && func->iad_desc.string &&
+	    func->iad_desc.string[0] != '\0') {
+		func->iad_string_idx = idx++;
+		bytes += strlen(func->iad_desc.string) + 1;
+	} else {
+		func->iad_string_idx = 0;
+	}
 
 	for (i = 0; i < func->interface_count; ++i) {
 		struct usbf_interface *intf = func->interfaces[i];
@@ -447,13 +469,18 @@ int usbf_start(struct usbf_function *func)
 
 		total_class_descs(func, &n_class, &class_bytes);
 
-		/* All speeds share the same interface descriptors, class
-		 * descriptors, and endpoint descriptors. SS additionally
-		 * appends a 6-byte SS companion after each endpoint. */
+		/* All speeds share the same IAD (when set), interface
+		 * descriptors, class descriptors, and endpoint descriptors.
+		 * SS additionally appends a 6-byte SS companion after each
+		 * endpoint. */
 		base_size = alts * sizeof(struct usb_interface_descriptor) +
 			class_bytes +
 			eps * sizeof(struct usb_endpoint_descriptor_no_audio);
 		base_count = alts + n_class + eps;
+		if (func->has_iad) {
+			base_size += sizeof(struct usb_interface_assoc_descriptor);
+			base_count += 1;
+		}
 
 		descs.speeds = !!(func->flags & USBF_SPEED_FS) +
 			!!(func->flags & USBF_SPEED_HS) +
@@ -497,6 +524,18 @@ int usbf_start(struct usbf_function *func)
 		while (!(speed & func->flags))
 			speed <<= 1;
 		cur = __usbf_descs_access_speed_block(&descs, k);
+		if (func->has_iad) {
+			struct usb_interface_assoc_descriptor *iad = cur;
+			iad->bLength = sizeof(*iad);
+			iad->bDescriptorType = USB_DT_INTERFACE_ASSOCIATION;
+			iad->bFirstInterface = 0;
+			iad->bInterfaceCount = func->interface_count;
+			iad->bFunctionClass = func->iad_desc.function_class;
+			iad->bFunctionSubClass = func->iad_desc.function_subclass;
+			iad->bFunctionProtocol = func->iad_desc.function_protocol;
+			iad->iFunction = func->iad_string_idx;
+			cur += sizeof(*iad);
+		}
 		for (i = 0; i < func->interface_count; ++i) {
 			intf = func->interfaces[i];
 			for (a = 0; a < intf->alt_count; ++a) {
@@ -591,6 +630,10 @@ int usbf_start(struct usbf_function *func)
 		char *body = __usbf_strings_body(&strings);
 		*(__le16 *)body = htole16(0x0409);
 		body += sizeof(__le16);
+		if (func->iad_string_idx != 0) {
+			strcpy(body, func->iad_desc.string);
+			body += strlen(func->iad_desc.string) + 1;
+		}
 		for (i = 0; i < func->interface_count; ++i) {
 			struct usbf_interface *p = func->interfaces[i];
 			if (p->string_idx == 0)

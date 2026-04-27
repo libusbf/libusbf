@@ -70,6 +70,9 @@ struct usbf_function {
 	uint32_t flags;
 	struct usbf_interface *interfaces[MAX_INTERFACES];
 	int interface_count;
+	struct usbf_iad_descriptor iad_desc;
+	int has_iad;
+	int iad_string_idx;
 	int ep0_file;
 
 	/* Event loop state, valid between usbf_start and usbf_stop. */

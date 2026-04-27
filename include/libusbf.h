@@ -132,6 +132,22 @@ struct usbf_function_descriptor {
 	int (*setup_handler)(const struct usbf_setup_request *);
 };
 
+/* Optional Interface Association Descriptor for the whole function. When
+ * set, libusbf emits one IAD before the first interface descriptor with
+ * bFirstInterface = 0 and bInterfaceCount = number of interfaces declared,
+ * marking every interface of this function as a single logical group on
+ * the host. Required by some composite-class stacks (CDC ACM, UVC, UAC2
+ * with terminals). The libusbf "function" abstraction maps 1:1 to one
+ * IAD; multi-IAD layouts are expressed as separate FunctionFS functions
+ * composed at the configfs/composite layer. */
+struct usbf_iad_descriptor {
+	uint8_t function_class;
+	uint8_t function_subclass;
+	uint8_t function_protocol;
+	/* en-US iFunction name; NULL or "" leaves iFunction = 0. */
+	char *string;
+};
+
 /* Completion callback for usbf_submit. `result` follows kernel AIO semantics:
  * on success it is the number of bytes transferred (may be 0); on failure it
  * is a negative errno. `data` and `length` are the pointer and length originally
@@ -145,6 +161,14 @@ struct usbf_function *
 usbf_create_function(struct usbf_function_descriptor *func, char *path);
 
 void usbf_delete_function(struct usbf_function *func);
+
+/* Attach an Interface Association Descriptor to the function. Must be called
+ * before usbf_start. Calling more than once replaces the previous IAD.
+ * libusbf stores the descriptor by value (copying the struct); the iFunction
+ * `string` pointer is borrowed and must remain valid until usbf_start
+ * returns. Returns 0 on success or a negative errno. */
+int usbf_set_iad(struct usbf_function *func,
+                 struct usbf_iad_descriptor *desc);
 
 /* Add an interface to the function. bInterfaceNumber is assigned in the order
  * interfaces are added: first call returns interface 0, second returns 1, and

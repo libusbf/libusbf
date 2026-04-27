@@ -196,6 +196,20 @@ int usbf_run(struct usbf_function *func);
 int usbf_submit(struct usbf_endpoint *ep, void *data, size_t length,
                 usbf_completion_cb cb, void *user);
 
+/* Cancel every in-flight submit on `ep`. The kernel completes each canceled
+ * iocb synchronously; libusbf invokes its completion callback with the
+ * kernel's cancellation result (typically a negative errno such as
+ * -ECONNRESET) before freeing the iocb slot. Returns the number of submits
+ * actually canceled. Must be called from the same thread that drives the
+ * event loop. */
+int usbf_cancel(struct usbf_endpoint *ep);
+
+/* Cancel every in-flight submit on the function, regardless of endpoint.
+ * Same callback / return semantics as usbf_cancel; intended for clean
+ * shutdown paths where the user wants every outstanding buffer accounted
+ * for before tearing the function down. */
+int usbf_cancel_all(struct usbf_function *func);
+
 /* Stall a data endpoint from the gadget side. The host's next transfer on
  * this endpoint receives a STALL handshake until the halt is cleared
  * (either by the gadget via usbf_clear_halt or by the host via a standard

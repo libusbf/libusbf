@@ -29,6 +29,7 @@ struct usbf_iocb {
 	usbf_completion_cb complete;
 	void *user;
 	struct usbf_iocb *next_free;
+	int in_flight;
 };
 
 struct usbf_endpoint {

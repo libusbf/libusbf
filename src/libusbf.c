@@ -23,6 +23,8 @@
 #define TAG_EP0	0
 #define TAG_AIO	1
 
+static int drain_completions(struct usbf_function *func);
+
 struct usbf_function *
 usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 {
@@ -61,9 +63,11 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 
 	/* Build the free list linking every iocb slot. */
 	func->free_iocb = &func->iocb_pool[0];
-	for (i = 0; i < MAX_INFLIGHT - 1; ++i)
-		func->iocb_pool[i].next_free = &func->iocb_pool[i + 1];
-	func->iocb_pool[MAX_INFLIGHT - 1].next_free = NULL;
+	for (i = 0; i < MAX_INFLIGHT; ++i) {
+		func->iocb_pool[i].in_flight = 0;
+		func->iocb_pool[i].next_free = (i < MAX_INFLIGHT - 1)
+			? &func->iocb_pool[i + 1] : NULL;
+	}
 
 	return func;
 }
@@ -779,12 +783,52 @@ int usbf_submit(struct usbf_endpoint *ep, void *data, size_t length,
 			ret = -EAGAIN;
 		goto err;
 	}
+	uio->in_flight = 1;
 	return 0;
 
 err:
 	uio->next_free = func->free_iocb;
 	func->free_iocb = uio;
 	return ret;
+}
+
+static int cancel_iocbs(struct usbf_function *func, struct usbf_endpoint *match)
+{
+	struct io_event ev;
+	int i, count = 0;
+
+	for (i = 0; i < MAX_INFLIGHT; ++i) {
+		struct usbf_iocb *uio = &func->iocb_pool[i];
+		int ret;
+
+		if (!uio->in_flight)
+			continue;
+		if (match && uio->ep != match)
+			continue;
+
+		ret = io_cancel(func->aio_ctx, &uio->cb, &ev);
+		/* Modern kernels return -EINPROGRESS to mean "cancellation
+		 * initiated; the result will be delivered via the ring
+		 * buffer". Older interfaces returned 0 with `ev` populated.
+		 * Either way the iocb counts as canceled; drain_completions
+		 * below fires the user callback once the kernel posts the
+		 * event. */
+		if (ret == 0 || ret == -EINPROGRESS)
+			count++;
+	}
+
+	drain_completions(func);
+	return count;
+}
+
+int usbf_cancel(struct usbf_endpoint *ep)
+{
+	return cancel_iocbs(ep->func, ep);
+}
+
+int usbf_cancel_all(struct usbf_function *func)
+{
+	return cancel_iocbs(func, NULL);
 }
 
 int usbf_halt(struct usbf_endpoint *ep)
@@ -903,6 +947,7 @@ static int drain_completions(struct usbf_function *func)
 
 		for (i = 0; i < got; ++i) {
 			uio = (struct usbf_iocb *)ev[i].obj;
+			uio->in_flight = 0;
 			if (uio->complete)
 				uio->complete(uio->ep, uio->data, uio->length,
 				              ev[i].res, uio->user);

@@ -4,7 +4,58 @@
 
 #include <libusbf.h>
 
-int event_handler(enum usbf_event_type event)
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+
+static struct usbf_endpoint *ep_in, *ep_out;
+static unsigned char buf[512];
+static int enabled;
+
+static void out_complete(struct usbf_endpoint *ep, void *data, size_t length,
+                         ssize_t result, void *user);
+static void in_complete(struct usbf_endpoint *ep, void *data, size_t length,
+                        ssize_t result, void *user);
+
+static void submit_out(void)
+{
+	int ret = usbf_submit(ep_out, buf, sizeof(buf), out_complete, NULL);
+	if (ret < 0)
+		fprintf(stderr, "submit OUT failed: %s\n", strerror(-ret));
+}
+
+static void submit_in(size_t n)
+{
+	int ret = usbf_submit(ep_in, buf, n, in_complete, NULL);
+	if (ret < 0)
+		fprintf(stderr, "submit IN failed: %s\n", strerror(-ret));
+}
+
+static void out_complete(struct usbf_endpoint *ep, void *data, size_t length,
+                         ssize_t result, void *user)
+{
+	if (!enabled)
+		return;
+	if (result < 0) {
+		fprintf(stderr, "OUT error: %s\n", strerror(-result));
+		return;
+	}
+	submit_in(result);
+}
+
+static void in_complete(struct usbf_endpoint *ep, void *data, size_t length,
+                        ssize_t result, void *user)
+{
+	if (!enabled)
+		return;
+	if (result < 0) {
+		fprintf(stderr, "IN error: %s\n", strerror(-result));
+		return;
+	}
+	submit_out();
+}
+
+static int event_handler(enum usbf_event_type event)
 {
 	static const char *const names[] = {
 		[USBF_EVENT_BIND] = "BIND",
@@ -17,15 +68,24 @@ int event_handler(enum usbf_event_type event)
 
 	printf("EVENT: %s\n", names[event]);
 
+	switch (event) {
+	case USBF_EVENT_ENABLE:
+		enabled = 1;
+		submit_out();
+		break;
+	case USBF_EVENT_DISABLE:
+		enabled = 0;
+		break;
+	default:
+		break;
+	}
 	return 0;
 }
 
 int main(int argc, char *argv[])
 {
 	struct usbf_function *my_func;
-	struct usbf_endpoint *ep_in, *ep_out;
-	unsigned char buf[512];
-	int ret, i;
+	int ret;
 
 	struct usbf_function_descriptor f_desc = {
 		.speed = USBF_SPEED_FS | USBF_SPEED_HS,
@@ -75,20 +135,14 @@ int main(int argc, char *argv[])
 		goto error;
 	}
 
-	for (i = 0; i < 42; ++i) {
-		usbf_handle_events(my_func);
-		ret = usbf_transfer(ep_out, buf, sizeof(buf));
-		if (ret < 0)
-			fprintf(stderr, "Transfer error (out)!\n");
-		ret = usbf_transfer(ep_in, buf, sizeof(buf));
-		if (ret < 0)
-			fprintf(stderr, "Transfer error (in)!\n");
-	}
+	ret = usbf_run(my_func);
+	if (ret < 0)
+		fprintf(stderr, "Run failed: %s\n", strerror(-ret));
 
 	usbf_stop(my_func);
+	ret = 0;
 
 error:
 	usbf_delete_function(my_func);
-
 	return ret;
 }

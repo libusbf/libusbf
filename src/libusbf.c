@@ -20,9 +20,10 @@
 #include <sys/ioctl.h>
 #include <dirent.h>
 
-/* epoll .data.u32 tags for the two fds we watch */
-#define TAG_EP0	0
-#define TAG_AIO	1
+/* epoll .data.u32 tags for the fds we watch */
+#define TAG_EP0		0
+#define TAG_AIO		1
+#define TAG_STOP	2
 
 static int drain_completions(struct usbf_function *func);
 
@@ -75,6 +76,7 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 	func->ep0_file = -1;
 	func->epoll_fd = -1;
 	func->event_fd = -1;
+	func->stop_fd = -1;
 	func->aio_ctx = 0;
 	func->running = 0;
 
@@ -710,10 +712,16 @@ int usbf_start(struct usbf_function *func)
 		goto err_aio;
 	}
 
+	func->stop_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (func->stop_fd < 0) {
+		ret = -errno;
+		goto err_eventfd;
+	}
+
 	func->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
 	if (func->epoll_fd < 0) {
 		ret = -errno;
-		goto err_eventfd;
+		goto err_stopfd;
 	}
 
 	eev.events = EPOLLIN;
@@ -727,6 +735,11 @@ int usbf_start(struct usbf_function *func)
 		ret = -errno;
 		goto err_epoll;
 	}
+	eev.data.u32 = TAG_STOP;
+	if (epoll_ctl(func->epoll_fd, EPOLL_CTL_ADD, func->stop_fd, &eev) < 0) {
+		ret = -errno;
+		goto err_epoll;
+	}
 
 	ret = 0;
 	goto out3;
@@ -734,6 +747,9 @@ int usbf_start(struct usbf_function *func)
 err_epoll:
 	close(func->epoll_fd);
 	func->epoll_fd = -1;
+err_stopfd:
+	close(func->stop_fd);
+	func->stop_fd = -1;
 err_eventfd:
 	close(func->event_fd);
 	func->event_fd = -1;
@@ -770,9 +786,23 @@ void usbf_stop(struct usbf_function *func)
 
 	func->running = 0;
 
+	/* Wake epoll_wait if usbf_run is mid-loop, so it sees running == 0
+	 * and exits instead of blocking forever. */
+	if (func->stop_fd >= 0) {
+		uint64_t one = 1;
+		ssize_t r;
+		do {
+			r = write(func->stop_fd, &one, sizeof(one));
+		} while (r < 0 && errno == EINTR);
+	}
+
 	if (func->epoll_fd >= 0) {
 		close(func->epoll_fd);
 		func->epoll_fd = -1;
+	}
+	if (func->stop_fd >= 0) {
+		close(func->stop_fd);
+		func->stop_fd = -1;
 	}
 	if (func->event_fd >= 0) {
 		close(func->event_fd);
@@ -1096,6 +1126,8 @@ int usbf_dispatch(struct usbf_function *func)
 			if (ret < 0)
 				return ret;
 		}
+		/* TAG_STOP is only used to wake usbf_run; for an
+		 * external loop, the eventfd just goes unread. */
 	}
 	return 0;
 }
@@ -1114,6 +1146,10 @@ int usbf_run(struct usbf_function *func)
 			return -errno;
 		}
 		for (i = 0; i < n; ++i) {
+			/* If a callback called usbf_stop, skip remaining
+			 * events: their fds may already be closed. */
+			if (!func->running)
+				break;
 			if (events[i].data.u32 == TAG_EP0) {
 				ret = drain_ep0_events(func);
 				if (ret)

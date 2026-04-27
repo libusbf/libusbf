@@ -78,6 +78,7 @@ struct usbf_function {
 	/* Event loop state, valid between usbf_start and usbf_stop. */
 	int epoll_fd;
 	int event_fd;
+	int stop_fd;
 	io_context_t aio_ctx;
 	int running;
 

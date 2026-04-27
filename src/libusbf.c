@@ -514,7 +514,7 @@ int usbf_setup_ack(const struct usbf_setup_request *setup)
 		read(setup->function->ep0_file, NULL, 0);
 }
 
-int usbf_setup_response(const struct usbf_setup_request *setup,
+ssize_t usbf_setup_response(const struct usbf_setup_request *setup,
 	void *data, size_t length)
 {
 	return (setup->bRequestType & USB_DIR_IN) ?

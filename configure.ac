@@ -24,6 +24,6 @@ AC_CHECK_LIB([aio], [io_setup], [:],
 AC_CHECK_HEADER([libaio.h], [],
 	[AC_MSG_ERROR([libaio.h is required (install libaio-dev)])])
 
-AC_CONFIG_FILES([Makefile src/Makefile examples/Makefile])
+AC_CONFIG_FILES([Makefile src/Makefile])
 
 AC_OUTPUT

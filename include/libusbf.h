@@ -141,7 +141,7 @@ int usbf_submit(struct usbf_endpoint *ep, void *data, size_t length,
 /* ep0 setup-request helpers (called from setup_handler). */
 int usbf_setup_ack(const struct usbf_setup_request *setup);
 
-int usbf_setup_response(const struct usbf_setup_request *setup,
+ssize_t usbf_setup_response(const struct usbf_setup_request *setup,
 	void *data, size_t length);
 
 /* Stall the current ep0 setup request. Returns 0 on success or a negative

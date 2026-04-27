@@ -3,13 +3,52 @@
  * Copyright (C) 2014-2026 Robert Baldyga
  */
 
+/*
+ * libusbf - declarative USB function library on top of FunctionFS.
+ *
+ * The user describes the USB function as a tree of objects:
+ *
+ *     usbf_function
+ *       (optional usbf_iad_descriptor)
+ *       usbf_interface
+ *         usbf_alt_setting
+ *           (optional class-specific descriptor blobs)
+ *           usbf_endpoint
+ *           ...
+ *         ...
+ *       ...
+ *
+ * libusbf synthesizes the USB descriptor blob and strings table from that
+ * tree, writes them to FunctionFS' ep0, opens the data endpoint files, and
+ * dispatches events plus AIO completions through an event loop.
+ *
+ * Typical usage:
+ *
+ *     usbf_create_function()      construct the function
+ *     usbf_add_interface()        \
+ *     usbf_add_alt_setting()      |  describe topology
+ *     usbf_add_endpoint()         /
+ *     usbf_set_iad()              optional, before usbf_start
+ *     usbf_start()                push descriptors, open endpoint files
+ *     usbf_run()                  drive the event loop until stopped
+ *     usbf_stop()                 unwind on shutdown
+ *     usbf_delete_function()      free the function tree
+ *
+ * Within callbacks (event_handler / setup_handler / completion callbacks)
+ * the library is single-threaded: every callback fires from the same
+ * thread that drives the event loop, so user code does not need locking
+ * around libusbf state.
+ */
+
 #ifndef __LIBUSBF_H__
 #define __LIBUSBF_H__
 
-#include <stdio.h>
 #include <stdint.h>
 #include <sys/types.h>
 
+/* USB-IF assigned interface class codes. The set tracks the interface-class
+ * column from https://www.usb.org/defined-class-codes; users can also pass a
+ * raw byte (cast to enum usbf_class) for codes not enumerated here. */
 enum usbf_class {
 	USBF_CLASS_PER_INTERFACE = 0,
 	USBF_CLASS_AUDIO = 1,
@@ -28,9 +67,22 @@ enum usbf_class {
 	USBF_CLASS_MISC = 0xef,
 	USBF_CLASS_APP_SPEC = 0xfe,
 	USBF_CLASS_VENDOR_SPEC = 0xff,
+};
+
+/* Interface subclass codes. Most subclasses are class-specific (e.g.
+ * audio control vs. audio streaming under USBF_CLASS_AUDIO), so libusbf
+ * does not enumerate them; the one universal value is the vendor-specific
+ * placeholder that pairs with USBF_CLASS_VENDOR_SPEC. */
+enum usbf_subclass {
 	USBF_SUBCLASS_VENDOR_SPEC = 0xff,
 };
 
+/* Bitmask of negotiable bus speeds. OR these into
+ * usbf_function_descriptor.speed to declare which speeds the function
+ * supports; FunctionFS rejects the descriptor blob if the gadget is bound
+ * to a UDC whose speed isn't represented here. The same values are returned
+ * by usbf_get_speed() to identify the actually-negotiated speed at
+ * runtime. */
 enum usbf_flags {
 	USBF_SPEED_FS = 0x01,
 	USBF_SPEED_HS = 0x02,
@@ -50,17 +102,34 @@ enum usbf_function_flags {
 	USBF_ALL_CTRL_RECIP = 0x01,
 };
 
+/* Endpoint transfer type. Values map directly to the bmAttributes[1:0]
+ * field of the USB endpoint descriptor (control = 0 is reserved for ep0
+ * and never appears here). */
 enum usbf_endpoint_type {
 	USBF_ISOCHRONOUS = 0x01,
 	USBF_BULK = 0x02,
 	USBF_INTERRUPT = 0x03,
 };
 
+/* Endpoint direction, as encoded in bit 7 of bEndpointAddress. */
 enum usbf_endpoint_direction {
-	USBF_OUT = 0x00,
-	USBF_IN = 0x80,
+	USBF_OUT = 0x00,  /* host -> gadget */
+	USBF_IN = 0x80,   /* gadget -> host */
 };
 
+/* Event types passed to usbf_function_descriptor.event_handler. The values
+ * match FunctionFS' event numbering so libusbf can forward them verbatim.
+ *
+ * BIND / UNBIND fire when the gadget is bound to / unbound from a USB
+ * configuration at the configfs/composite layer.
+ *
+ * ENABLE / DISABLE fire when the host transitions the configuration in or
+ * out of "configured" state (SET_CONFIGURATION). All in-flight AIO
+ * transfers are completed (with a negative result) by the kernel on
+ * DISABLE; the gadget normally re-arms its receive buffers on ENABLE.
+ *
+ * SUSPEND / RESUME fire on USB bus suspend/resume (3+ ms of idle).
+ */
 enum usbf_event_type {
 	USBF_EVENT_BIND,
 	USBF_EVENT_UNBIND,
@@ -68,6 +137,10 @@ enum usbf_event_type {
 	USBF_EVENT_ENABLE,
 	USBF_EVENT_DISABLE,
 
+	/* Placeholder so subsequent values keep their FunctionFS-matching
+	 * numbers. SETUP requests are intercepted by libusbf and routed to
+	 * usbf_function_descriptor.setup_handler instead, so this value is
+	 * never delivered to event_handler. */
 	__USBF_EVENT_SETUP,
 
 	USBF_EVENT_SUSPEND,
@@ -79,6 +152,11 @@ struct usbf_interface;
 struct usbf_alt_setting;
 struct usbf_endpoint;
 
+/* Setup packet delivered to setup_handler. The five USB-spec fields carry
+ * native (host) byte order; libusbf converts from little-endian on the wire
+ * before invoking the handler. `function` is the function this setup
+ * targets - handlers can pass it to other libusbf entry points
+ * (usbf_find_endpoint, usbf_cancel_all, etc.) without keeping a side table. */
 struct usbf_setup_request {
 	uint8_t bRequestType;
 	uint8_t bRequest;
@@ -89,6 +167,21 @@ struct usbf_setup_request {
 	struct usbf_function *function;
 };
 
+/* Per-endpoint shape, replicated per-speed because a single endpoint emits
+ * one descriptor per declared speed and they may differ (e.g. bulk uses 64
+ * mps at FS but 512 at HS). Only fields for speeds the function actually
+ * declares (usbf_function_descriptor.speed) are read; the rest may stay 0.
+ *
+ * <speed>_maxpacketsize:
+ *     wMaxPacketSize, in bytes. Bulk: 8/16/32/64 at FS, 512 at HS, 1024 at
+ *     SS. Interrupt: up to 64 at FS, up to 1024 at HS, up to 1024 at SS.
+ *     Isochronous: up to 1023 at FS, up to 1024 at HS (with mult), up to
+ *     1024 at SS.
+ *
+ * <speed>_interval:
+ *     bInterval. Bulk endpoints ignore it. Interrupt at FS uses frames
+ *     (1..255 ms). Interrupt/isoc at HS or SS use 2^(bInterval-1)
+ *     microframes (125 us units); valid range 1..16. */
 struct usbf_endpoint_descriptor {
 	uint16_t fs_maxpacketsize;
 	uint16_t hs_maxpacketsize;
@@ -117,8 +210,11 @@ struct usbf_endpoint_descriptor {
 	uint8_t ss_attributes;
 	uint16_t ss_bytes_per_interval;
 
+	/* Transfer type (bulk / interrupt / isoc). Control endpoints (ep0)
+	 * are owned by FunctionFS and not declared here. */
 	enum usbf_endpoint_type type;
 
+	/* USBF_IN (gadget -> host) or USBF_OUT (host -> gadget). */
 	enum usbf_endpoint_direction direction;
 };
 
@@ -139,6 +235,33 @@ struct usbf_interface_descriptor {
 	char *string;
 };
 
+/* Per-function configuration, passed to usbf_create_function. The
+ * descriptor is copied by value, so the caller does not need to keep it
+ * around after the call.
+ *
+ * speed:
+ *     Bitmask of usbf_flags identifying which negotiated speeds the
+ *     function supports. Must be non-zero and only contain
+ *     USBF_SPEED_FS / HS / SS bits.
+ *
+ * flags:
+ *     Bitmask of usbf_function_flags. May be 0.
+ *
+ * event_handler:
+ *     Optional. Called for non-SETUP ep0 events (BIND, UNBIND, ENABLE,
+ *     DISABLE, SUSPEND, RESUME). A non-zero return causes usbf_run() /
+ *     usbf_dispatch() to abort with that value. May be NULL if the
+ *     function does not need to react to lifecycle transitions.
+ *
+ * setup_handler:
+ *     Optional. Called for every SETUP packet that FunctionFS routes to
+ *     this function (Interface- and Endpoint-recipient by default; add
+ *     Device/Other recipients via USBF_ALL_CTRL_RECIP). The handler must
+ *     finalize the request with usbf_setup_ack / usbf_setup_response /
+ *     usbf_setup_stall before returning. Its return value is currently
+ *     ignored by libusbf - error reporting goes through the setup helper
+ *     return codes. May be NULL, in which case libusbf stalls every
+ *     SETUP that reaches the function. */
 struct usbf_function_descriptor {
 	uint32_t speed;
 	uint32_t flags;
@@ -170,10 +293,23 @@ typedef void (*usbf_completion_cb)(struct usbf_endpoint *ep,
                                    void *data, size_t length,
                                    ssize_t result, void *user);
 
-/* Lifecycle */
+/* Lifecycle.
+ *
+ * Construct an empty function from `desc` rooted at the FunctionFS mount
+ * `path` (e.g. "/dev/ffs/myfunc"; the FunctionFS instance must already be
+ * mounted). The returned handle owns no kernel resources yet - that
+ * happens at usbf_start. Returns NULL on validation failure or
+ * allocation error.
+ *
+ * libusbf copies `desc` and stores `path` as a null-terminated string;
+ * neither pointer needs to outlive this call. */
 struct usbf_function *
-usbf_create_function(struct usbf_function_descriptor *func, char *path);
+usbf_create_function(struct usbf_function_descriptor *desc, char *path);
 
+/* Tear down the function tree built by usbf_create_function and freeing
+ * every interface, alt-setting, endpoint and class-descriptor blob
+ * underneath it. Safe to call after usbf_stop, or directly on a
+ * never-started function. */
 void usbf_delete_function(struct usbf_function *func);
 
 /* Attach an Interface Association Descriptor to the function. Must be called
@@ -192,10 +328,22 @@ struct usbf_interface *
 usbf_add_interface(struct usbf_function *func,
                    struct usbf_interface_descriptor *desc);
 
-/* Add an alternate setting to an interface. bAlternateSetting is assigned in
- * the order alt-settings are added on that interface. */
+/* Add an alternate setting to an interface. bAlternateSetting is assigned
+ * in the order alt-settings are added on that interface - first call
+ * returns alt 0, second returns 1, and so on. Every interface must have
+ * at least one alt-setting (alt 0). Returns NULL on allocation failure
+ * or when the per-interface alt-setting limit is reached. */
 struct usbf_alt_setting *usbf_add_alt_setting(struct usbf_interface *intf);
 
+/* Add a data endpoint to an alt-setting. Endpoint numbers are assigned
+ * sequentially across the entire function in declaration order - the
+ * first endpoint added (across any interface/alt) becomes endpoint 1,
+ * the second endpoint 2, and so on; bEndpointAddress combines that
+ * number with the direction bit from `desc->direction`. Returns NULL on
+ * allocation failure or when the per-alt endpoint limit is reached.
+ *
+ * libusbf copies `desc` by value; the caller does not need to keep it
+ * around. */
 struct usbf_endpoint *usbf_add_endpoint(
 	struct usbf_alt_setting *alt, struct usbf_endpoint_descriptor *desc);
 
@@ -209,8 +357,34 @@ struct usbf_endpoint *usbf_add_endpoint(
 int usbf_add_class_descriptor(struct usbf_alt_setting *alt,
                               const void *data, size_t length);
 
+/* Activate the function: synthesize the FFS V2 descriptor blob and the
+ * strings table from the topology built so far, write them to ep0, open
+ * every data endpoint file, and stand up the internal event loop
+ * (epoll set + libaio context + completion eventfd). After a successful
+ * return the function is ready to be bound to a UDC at the
+ * configfs/composite layer; the host-visible enumeration kicks off as
+ * soon as that binding completes. The function must already have at
+ * least one interface with at least one alt-setting. Returns 0 on
+ * success or a negative errno. */
 int usbf_start(struct usbf_function *func);
 
+/* Reverse usbf_start: wake any usbf_run() that's currently blocked in
+ * epoll_wait so it sees the cleared running flag and returns, then tear
+ * down the event loop, close every endpoint file plus ep0, and release
+ * the libaio context. Any in-flight AIO is canceled by the kernel during
+ * io_destroy; if the user wants their completion callbacks to fire first
+ * they should call usbf_cancel_all and drive the event loop until those
+ * callbacks drain before calling usbf_stop. The function tree itself
+ * remains intact and can be usbf_start()ed again, or freed via
+ * usbf_delete_function.
+ *
+ * Threading: safe to call from a setup_handler / event_handler /
+ * completion callback (the run loop notices on its way back to
+ * epoll_wait). For a cross-thread stop, the caller must ensure
+ * usbf_run() / usbf_dispatch() on the loop thread has returned before
+ * the resource teardown here closes the fds out from under it; the
+ * eventfd write done above wakes the loop, but synchronizing the actual
+ * exit is the caller's responsibility. */
 void usbf_stop(struct usbf_function *func);
 
 /* Event loop integration.
@@ -223,10 +397,27 @@ void usbf_stop(struct usbf_function *func);
  *                  level-triggered POLLIN; call usbf_dispatch(func) when it
  *                  becomes readable.
  */
+
+/* Return the level-triggered file descriptor that signals "libusbf has
+ * work pending" - readiness for POLLIN means the caller should invoke
+ * usbf_dispatch. The fd is owned by libusbf and stays valid between
+ * usbf_start and usbf_stop; do not close it. */
 int usbf_get_fd(struct usbf_function *func);
 
+/* Drain any pending ep0 events and AIO completions, dispatching them to
+ * the user's event_handler / setup_handler / completion callbacks. Safe
+ * to call when no work is pending (returns 0 quickly). Returns 0 on
+ * success or a negative errno; if event_handler returned non-zero, that
+ * value is propagated here. Intended for callers driving their own
+ * event loop in conjunction with usbf_get_fd. */
 int usbf_dispatch(struct usbf_function *func);
 
+/* Run libusbf's built-in event loop. Blocks until usbf_stop() clears the
+ * running flag and writes to the loop's wakeup eventfd, at which point
+ * the next epoll_wait returns and the loop exits. Returns 0 on clean
+ * shutdown or a negative errno on a fatal I/O error; an event_handler
+ * returning non-zero also exits the loop with that value. See usbf_stop
+ * for the threading contract. */
 int usbf_run(struct usbf_function *func);
 
 /* I/O submission. Returns 0 on success (callback will fire later), or a
@@ -277,9 +468,21 @@ usbf_find_endpoint(struct usbf_function *func, uint8_t number);
  * and reset transitions. */
 int usbf_get_speed(struct usbf_function *func);
 
-/* ep0 setup-request helpers (called from setup_handler). */
+/* ep0 setup-request helpers (called from setup_handler). Each helper
+ * finalizes the current setup transaction; setup_handler must call
+ * exactly one of usbf_setup_ack / usbf_setup_response / usbf_setup_stall
+ * before returning. */
+
+/* Complete a no-data-stage setup request (the host expects a status
+ * stage with no payload). Returns 0 on success or a negative errno. */
 int usbf_setup_ack(const struct usbf_setup_request *setup);
 
+/* Complete a setup request with a data stage. For IN setups (host reads),
+ * `data`/`length` is the payload to send; the kernel forwards up to
+ * `setup->wLength` bytes and short-completes the rest. For OUT setups
+ * (host writes), `data` is the buffer to receive into and `length` is
+ * its capacity (must be >= wLength). Returns the number of bytes
+ * transferred on success or a negative errno on failure. */
 ssize_t usbf_setup_response(const struct usbf_setup_request *setup,
 	void *data, size_t length);
 

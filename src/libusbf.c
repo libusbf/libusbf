@@ -26,13 +26,24 @@
 
 static int drain_completions(struct usbf_function *func);
 
+static void init_iocb_pool(struct usbf_function *func)
+{
+	int i;
+
+	func->free_iocb = &func->iocb_pool[0];
+	for (i = 0; i < MAX_INFLIGHT; ++i) {
+		func->iocb_pool[i].in_flight = 0;
+		func->iocb_pool[i].next_free = (i < MAX_INFLIGHT - 1)
+			? &func->iocb_pool[i + 1] : NULL;
+	}
+}
+
 struct usbf_function *
 usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 {
 	const uint32_t speed_mask = USBF_SPEED_FS | USBF_SPEED_HS | USBF_SPEED_SS;
 	const uint32_t flags_mask = USBF_ALL_CTRL_RECIP;
 	struct usbf_function *func;
-	int i;
 
 	if (!desc || !path)
 		return NULL;
@@ -66,14 +77,6 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 	func->event_fd = -1;
 	func->aio_ctx = 0;
 	func->running = 0;
-
-	/* Build the free list linking every iocb slot. */
-	func->free_iocb = &func->iocb_pool[0];
-	for (i = 0; i < MAX_INFLIGHT; ++i) {
-		func->iocb_pool[i].in_flight = 0;
-		func->iocb_pool[i].next_free = (i < MAX_INFLIGHT - 1)
-			? &func->iocb_pool[i + 1] : NULL;
-	}
 
 	return func;
 }
@@ -460,6 +463,8 @@ int usbf_start(struct usbf_function *func)
 	for (i = 0; i < func->interface_count; ++i)
 		if (func->interfaces[i]->alt_count == 0)
 			return -EINVAL;
+
+	init_iocb_pool(func);
 
 	{
 		int alts = total_alt_count(func);

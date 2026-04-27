@@ -29,6 +29,7 @@ struct usbf_function *
 usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 {
 	const uint32_t speed_mask = USBF_SPEED_FS | USBF_SPEED_HS | USBF_SPEED_SS;
+	const uint32_t flags_mask = USBF_ALL_CTRL_RECIP;
 	struct usbf_function *func;
 	int i;
 
@@ -38,6 +39,8 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 	if (desc->speed & ~speed_mask)
 		return NULL;
 	if (!(desc->speed & speed_mask))
+		return NULL;
+	if (desc->flags & ~flags_mask)
 		return NULL;
 
 	func = malloc(sizeof(*func));
@@ -506,8 +509,14 @@ int usbf_start(struct usbf_function *func)
 
 	descs_header = __usbf_descs_access_header(&descs);
 	descs_header->magic = htole32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2);
-	/* Our speed flags has the same value as in FunctionFS */
-	descs_header->flags = htole32(func->flags);
+	{
+		/* Our speed flags has the same value as in FunctionFS;
+		 * usbf_function_flags map to their FFS counterparts here. */
+		uint32_t ffs_flags = func->flags;
+		if (func->desc.flags & USBF_ALL_CTRL_RECIP)
+			ffs_flags |= FUNCTIONFS_ALL_CTRL_RECIP;
+		descs_header->flags = htole32(ffs_flags);
+	}
 	descs_header->length = htole32(descs.length);
 
 	for (i = 0; i < descs.speeds; ++i) {

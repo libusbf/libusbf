@@ -37,6 +37,19 @@ enum usbf_flags {
 	USBF_SPEED_SS = 0x04,
 };
 
+enum usbf_function_flags {
+	/* Forward control requests with non-Interface and non-Endpoint
+	 * recipients (Device, Other) to setup_handler. Without this flag,
+	 * FunctionFS only routes Interface- and Endpoint-recipient setup
+	 * requests to the gadget; everything else is handled by the kernel
+	 * composite layer. Set this when the gadget owns vendor/Device or
+	 * standard/Device requests (e.g. some HID GET_REPORT layouts,
+	 * vendor-specific device-recipient requests). The wIndex passed
+	 * to setup_handler is the raw value from the bus when the request
+	 * is non-Interface and non-Endpoint. */
+	USBF_ALL_CTRL_RECIP = 0x01,
+};
+
 enum usbf_endpoint_type {
 	USBF_ISOCHRONOUS = 0x01,
 	USBF_BULK = 0x02,
@@ -128,6 +141,7 @@ struct usbf_interface_descriptor {
 
 struct usbf_function_descriptor {
 	uint32_t speed;
+	uint32_t flags;
 	int (*event_handler)(enum usbf_event_type);
 	int (*setup_handler)(const struct usbf_setup_request *);
 };

@@ -28,6 +28,9 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 	struct usbf_function *func;
 	int i;
 
+	if (!desc || !path)
+		return NULL;
+
 	if (desc->speed & ~(0x07))
 		return NULL;
 	if (!(desc->speed & 0x07))

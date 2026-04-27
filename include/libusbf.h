@@ -196,6 +196,26 @@ int usbf_run(struct usbf_function *func);
 int usbf_submit(struct usbf_endpoint *ep, void *data, size_t length,
                 usbf_completion_cb cb, void *user);
 
+/* Stall a data endpoint from the gadget side. The host's next transfer on
+ * this endpoint receives a STALL handshake until the halt is cleared
+ * (either by the gadget via usbf_clear_halt or by the host via a standard
+ * ClearFeature(HALT) request). Pending AIO submits stay queued and resume
+ * once the halt is cleared. Returns 0 on success or a negative errno. */
+int usbf_halt(struct usbf_endpoint *ep);
+
+/* Clear a halted endpoint's stall state. Idempotent: calling on an
+ * unhalted endpoint is a no-op. Returns 0 on success or a negative errno. */
+int usbf_clear_halt(struct usbf_endpoint *ep);
+
+/* Look up an endpoint by its logical number, as delivered in wIndex to
+ * setup_handler for endpoint-recipient setup requests (FFS strips the
+ * direction bit during reverse-mapping, so wIndex is the bare number 1..15).
+ * Returns the matching usbf_endpoint, or NULL if no endpoint with that
+ * number is declared on the function. Useful for routing ClearFeature(HALT)
+ * and similar per-endpoint requests without keeping a manual mapping. */
+struct usbf_endpoint *
+usbf_find_endpoint(struct usbf_function *func, uint8_t number);
+
 /* ep0 setup-request helpers (called from setup_handler). */
 int usbf_setup_ack(const struct usbf_setup_request *setup);
 

@@ -17,6 +17,7 @@
 #include <sys/poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 
 /* epoll .data.u32 tags for the two fds we watch */
 #define TAG_EP0	0
@@ -784,6 +785,48 @@ err:
 	uio->next_free = func->free_iocb;
 	func->free_iocb = uio;
 	return ret;
+}
+
+int usbf_halt(struct usbf_endpoint *ep)
+{
+	ssize_t r;
+
+	/* Wrong-direction zero-length transfer signals halt to FFS, mirroring
+	 * the ep0 stall trick: read on an IN ep or write on an OUT ep makes
+	 * the kernel call usb_ep_set_halt() and return -EBADMSG via errno. */
+	if (ep->desc.direction == USBF_IN)
+		r = read(ep->epfile, NULL, 0);
+	else
+		r = write(ep->epfile, NULL, 0);
+	if (r < 0 && errno != EBADMSG)
+		return -errno;
+	return 0;
+}
+
+int usbf_clear_halt(struct usbf_endpoint *ep)
+{
+	if (ioctl(ep->epfile, FUNCTIONFS_CLEAR_HALT) < 0)
+		return -errno;
+	return 0;
+}
+
+struct usbf_endpoint *
+usbf_find_endpoint(struct usbf_function *func, uint8_t number)
+{
+	int i, a, e;
+
+	for (i = 0; i < func->interface_count; ++i) {
+		struct usbf_interface *intf = func->interfaces[i];
+		for (a = 0; a < intf->alt_count; ++a) {
+			struct usbf_alt_setting *alt = intf->alts[a];
+			for (e = 0; e < alt->ep_count; ++e) {
+				struct usbf_endpoint *ep = alt->endpoints[e];
+				if ((ep->address & 0x7f) == number)
+					return ep;
+			}
+		}
+	}
+	return NULL;
 }
 
 static int drain_ep0_events(struct usbf_function *func)

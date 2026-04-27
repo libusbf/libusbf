@@ -144,6 +144,9 @@ int usbf_setup_ack(const struct usbf_setup_request *setup);
 int usbf_setup_response(const struct usbf_setup_request *setup,
 	void *data, size_t length);
 
+/* Stall the current ep0 setup request. Returns 0 on success or a negative
+ * errno on real failure; the kernel's stall-acknowledged signal (EL2HLT)
+ * is treated as success and not surfaced to the caller. */
 int usbf_setup_stall(const struct usbf_setup_request *setup);
 
 #endif /* __LIBUSBF_H__ */

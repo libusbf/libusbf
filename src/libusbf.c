@@ -385,11 +385,16 @@ static int drain_ep0_events(struct usbf_function *func)
 
 		if (event.type == FUNCTIONFS_SETUP) {
 			if (!func->desc.setup_handler) {
-				ret = (event.u.setup.bRequestType & USB_DIR_IN)
-					? read(func->ep0_file, NULL, 0)
-					: write(func->ep0_file, NULL, 0);
-				if (ret)
-					return ret;
+				/* Stall via wrong-direction zero-length read or
+				 * write. FFS signals stall success with -EL2HLT
+				 * via errno (the kernel ack); treat it as
+				 * success. Any other negative is fatal. */
+				if (event.u.setup.bRequestType & USB_DIR_IN)
+					ret = read(func->ep0_file, NULL, 0);
+				else
+					ret = write(func->ep0_file, NULL, 0);
+				if (ret < 0 && errno != EL2HLT)
+					return -errno;
 				continue;
 			}
 			setup.bRequestType = event.u.setup.bRequestType;

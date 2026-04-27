@@ -372,15 +372,19 @@ static int drain_ep0_events(struct usbf_function *func)
 	int ret;
 
 	for (;;) {
-		ret = poll(&pfd, 1, 0);
+		do {
+			ret = poll(&pfd, 1, 0);
+		} while (ret < 0 && errno == EINTR);
 		if (ret < 0)
-			return ret;
+			return -errno;
 		if (ret == 0 || !(pfd.revents & POLLIN))
 			return 0;
 
-		ret = read(func->ep0_file, &event, sizeof(event));
+		do {
+			ret = read(func->ep0_file, &event, sizeof(event));
+		} while (ret < 0 && errno == EINTR);
 		if (ret < 0)
-			return ret;
+			return -errno;
 
 
 		if (event.type == FUNCTIONFS_SETUP) {

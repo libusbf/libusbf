@@ -77,12 +77,88 @@ void usbf_delete_function(struct usbf_function *func)
 	free(func);
 }
 
+/* Validate one (speed, mps, interval) tuple against the USB spec rules
+ * for the endpoint's transfer type. Lower 11 bits of mps are the
+ * per-transaction size; bits 11..12 carry the high-bandwidth multiplier
+ * for HS interrupt/isoc and must be 0 elsewhere. SS encodes burst/mult
+ * in the SS companion descriptor instead, so its mps top bits must be 0
+ * too. */
+static int validate_endpoint_speed(enum usbf_endpoint_type type,
+                                   uint16_t mps, uint8_t interval,
+                                   uint32_t speed)
+{
+	uint16_t size = mps & 0x07ff;
+	uint16_t mult = (mps >> 11) & 0x03;
+
+	switch (type) {
+	case USBF_BULK:
+		if (mult != 0)
+			return -EINVAL;
+		if (speed == USBF_SPEED_FS) {
+			if (size != 8 && size != 16 && size != 32 && size != 64)
+				return -EINVAL;
+		} else if (speed == USBF_SPEED_HS) {
+			if (size != 512)
+				return -EINVAL;
+		} else { /* SS */
+			if (size != 1024)
+				return -EINVAL;
+		}
+		/* bInterval is unused for bulk on FS/SS; HS allows a NAK-rate
+		 * hint in 0..255 which fits uint8_t natively, so nothing to
+		 * check. */
+		break;
+
+	case USBF_INTERRUPT:
+		if (size == 0)
+			return -EINVAL;
+		if (speed == USBF_SPEED_FS) {
+			if (size > 64 || mult != 0)
+				return -EINVAL;
+			if (interval == 0)
+				return -EINVAL;
+			/* FS interrupt bInterval is in frames, 1..255 -
+			 * naturally bounded by uint8_t. */
+		} else if (speed == USBF_SPEED_HS) {
+			if (size > 1024 || mult > 2)
+				return -EINVAL;
+			if (interval == 0 || interval > 16)
+				return -EINVAL;
+		} else { /* SS */
+			if (size > 1024 || mult != 0)
+				return -EINVAL;
+			if (interval == 0 || interval > 16)
+				return -EINVAL;
+		}
+		break;
+
+	case USBF_ISOCHRONOUS:
+		if (speed == USBF_SPEED_FS) {
+			if (size > 1023 || mult != 0)
+				return -EINVAL;
+			if (interval == 0 || interval > 16)
+				return -EINVAL;
+		} else if (speed == USBF_SPEED_HS) {
+			if (size > 1024 || mult > 2)
+				return -EINVAL;
+			if (interval == 0 || interval > 16)
+				return -EINVAL;
+		} else { /* SS */
+			if (size > 1024 || mult != 0)
+				return -EINVAL;
+			if (interval == 0 || interval > 16)
+				return -EINVAL;
+		}
+		break;
+	}
+	return 0;
+}
+
 struct usbf_endpoint *usbf_add_endpoint(
 	struct usbf_function *func, struct usbf_endpoint_descriptor *desc)
 {
 	struct usbf_endpoint *ep;
 
-	/* TODO - validate maxpacketsize and interval for selected speeds */
 	switch (desc->type) {
 	case USBF_ISOCHRONOUS:
 	case USBF_BULK:
@@ -91,6 +167,25 @@ struct usbf_endpoint *usbf_add_endpoint(
 	default:
 		return NULL;
 	}
+
+	if (desc->direction != USBF_IN && desc->direction != USBF_OUT)
+		return NULL;
+
+	if ((func->desc.speed & USBF_SPEED_FS) &&
+	    validate_endpoint_speed(desc->type,
+	                            desc->fs_maxpacketsize,
+	                            desc->fs_interval, USBF_SPEED_FS) < 0)
+		return NULL;
+	if ((func->desc.speed & USBF_SPEED_HS) &&
+	    validate_endpoint_speed(desc->type,
+	                            desc->hs_maxpacketsize,
+	                            desc->hs_interval, USBF_SPEED_HS) < 0)
+		return NULL;
+	if ((func->desc.speed & USBF_SPEED_SS) &&
+	    validate_endpoint_speed(desc->type,
+	                            desc->ss_maxpacketsize,
+	                            desc->ss_interval, USBF_SPEED_SS) < 0)
+		return NULL;
 
 	if (func->ep_count >= MAX_ENDPOINTS)
 		return NULL;

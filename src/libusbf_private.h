@@ -14,7 +14,7 @@
 #include <linux/usb/functionfs.h>
 #include <libaio.h>
 
-#define MAX_ENDPOINTS		16
+#define MAX_ENDPOINTS		15
 #define IOCBS_PER_ENDPOINT	32
 #define MAX_INFLIGHT		(MAX_ENDPOINTS * IOCBS_PER_ENDPOINT)
 

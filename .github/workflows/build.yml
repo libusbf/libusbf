@@ -32,3 +32,47 @@ jobs:
 
       - name: Build test gadgets
         run: make -C tests/gadgets
+
+  distcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake libtool pkg-config \
+            build-essential \
+            libaio-dev
+
+      - name: Build dist tarball and verify it builds, installs, uninstalls
+        run: |
+          ./autogen.sh
+          ./configure
+          make distcheck
+
+      - name: Verify pkg-config integration with a downstream consumer
+        run: |
+          tarball=$(ls libusbf-*.tar.gz)
+          version=${tarball#libusbf-}; version=${version%.tar.gz}
+          prefix="$PWD/_inst"
+
+          tar xf "$tarball"
+          cd "libusbf-${version}"
+          ./configure --prefix="$prefix"
+          make
+          make install
+          cd ..
+
+          export PKG_CONFIG_PATH="$prefix/lib/pkgconfig"
+          pkg-config --exists --print-errors libusbf
+          test "$(pkg-config --modversion libusbf)" = "$version"
+
+          cat > consumer.c <<'EOF'
+          #include <libusbf.h>
+          int main(void) { return (void *)usbf_create_function == 0; }
+          EOF
+          gcc consumer.c $(pkg-config --cflags --libs libusbf) \
+              -Wl,-rpath,"$prefix/lib" -o consumer
+          ./consumer

@@ -1,5 +1,9 @@
 # libusbf
 
+[![Build](https://github.com/libusbf/libusbf/actions/workflows/build.yml/badge.svg)](https://github.com/libusbf/libusbf/actions/workflows/build.yml)
+[![Tests](https://github.com/libusbf/libusbf/actions/workflows/tests.yml/badge.svg)](https://github.com/libusbf/libusbf/actions/workflows/tests.yml)
+[![License](https://img.shields.io/badge/License-LGPL_v2.1-blue.svg)](LICENSE)
+
 C library that simplifies writing the device side of USB functions on Linux
 by wrapping the FunctionFS API.  It's the device-side counterpart to libusb
 (which talks *to* USB devices from the host); not to be confused with

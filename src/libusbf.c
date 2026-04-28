@@ -57,7 +57,7 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 	strcpy(func->ffs_path, path);
 	memcpy(&func->desc, desc, sizeof(*desc));
 
-	func->flags = func->desc.speed;
+	func->speed_mask = func->desc.speed;
 	func->interface_count = 0;
 	func->has_iad = 0;
 	func->iad_string_idx = 0;
@@ -486,12 +486,12 @@ int usbf_start(struct usbf_function *func)
 			base_count += 1;
 		}
 
-		descs.speeds = !!(func->flags & USBF_SPEED_FS) +
-			!!(func->flags & USBF_SPEED_HS) +
-			!!(func->flags & USBF_SPEED_SS);
+		descs.speeds = !!(func->speed_mask & USBF_SPEED_FS) +
+			!!(func->speed_mask & USBF_SPEED_HS) +
+			!!(func->speed_mask & USBF_SPEED_SS);
 
 		for (s = USBF_SPEED_FS; s <= USBF_SPEED_SS; s <<= 1) {
-			if (!(func->flags & s))
+			if (!(func->speed_mask & s))
 				continue;
 			descs.per_speed_size[idx] = base_size;
 			descs.per_speed_count[idx] = base_count;
@@ -511,9 +511,10 @@ int usbf_start(struct usbf_function *func)
 	descs_header = __usbf_descs_access_header(&descs);
 	descs_header->magic = htole32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2);
 	{
-		/* Our speed flags has the same value as in FunctionFS;
-		 * usbf_function_flags map to their FFS counterparts here. */
-		uint32_t ffs_flags = func->flags;
+		/* Speed bits and FFS flag bits share the same wire format,
+		 * so seed ffs_flags with the speed mask and OR in any
+		 * usbf_function_flags that have an FFS counterpart. */
+		uint32_t ffs_flags = func->speed_mask;
 		if (func->desc.flags & USBF_ALL_CTRL_RECIP)
 			ffs_flags |= FUNCTIONFS_ALL_CTRL_RECIP;
 		descs_header->flags = htole32(ffs_flags);
@@ -531,7 +532,7 @@ int usbf_start(struct usbf_function *func)
 
 	speed = 1;
 	for (k = 0; k < descs.speeds; ++k) {
-		while (!(speed & func->flags))
+		while (!(speed & func->speed_mask))
 			speed <<= 1;
 		cur = __usbf_descs_access_speed_block(&descs, k);
 		if (func->has_iad) {

@@ -1,4 +1,4 @@
-AC_INIT([libusbf], [0.1], [robert@robertbaldyga.dev])
+AC_INIT([libusbf], [1.0], [robert@robertbaldyga.dev])
 AM_INIT_AUTOMAKE([-Wall -Werror foreign])
 
 AC_PROG_CC

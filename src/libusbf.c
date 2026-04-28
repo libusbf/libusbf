@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: LGPL-2.1-or-later
- * Copyright (C) 2014 Robert Baldyga
+ * Copyright (C) 2014-2026 Robert Baldyga
  */
 
 #include "libusbf_private.h"
@@ -17,15 +17,20 @@
 #include <sys/poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
+#include <dirent.h>
 
 /* epoll .data.u32 tags for the two fds we watch */
 #define TAG_EP0	0
 #define TAG_AIO	1
 
+static int drain_completions(struct usbf_function *func);
+
 struct usbf_function *
 usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 {
 	const uint32_t speed_mask = USBF_SPEED_FS | USBF_SPEED_HS | USBF_SPEED_SS;
+	const uint32_t flags_mask = USBF_ALL_CTRL_RECIP;
 	struct usbf_function *func;
 	int i;
 
@@ -35,6 +40,8 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 	if (desc->speed & ~speed_mask)
 		return NULL;
 	if (!(desc->speed & speed_mask))
+		return NULL;
+	if (desc->flags & ~flags_mask)
 		return NULL;
 
 	func = malloc(sizeof(*func));
@@ -51,7 +58,9 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 	memcpy(&func->desc, desc, sizeof(*desc));
 
 	func->flags = func->desc.speed;
-	func->ep_count = 0;
+	func->interface_count = 0;
+	func->has_iad = 0;
+	func->iad_string_idx = 0;
 	func->ep0_file = -1;
 	func->epoll_fd = -1;
 	func->event_fd = -1;
@@ -60,29 +69,256 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 
 	/* Build the free list linking every iocb slot. */
 	func->free_iocb = &func->iocb_pool[0];
-	for (i = 0; i < MAX_INFLIGHT - 1; ++i)
-		func->iocb_pool[i].next_free = &func->iocb_pool[i + 1];
-	func->iocb_pool[MAX_INFLIGHT - 1].next_free = NULL;
+	for (i = 0; i < MAX_INFLIGHT; ++i) {
+		func->iocb_pool[i].in_flight = 0;
+		func->iocb_pool[i].next_free = (i < MAX_INFLIGHT - 1)
+			? &func->iocb_pool[i + 1] : NULL;
+	}
 
 	return func;
 }
 
 void usbf_delete_function(struct usbf_function *func)
 {
-	int i;
+	int i, a, e, c;
 
-	for (i = 0; i < func->ep_count; ++i)
-		free(func->endpoints[i]);
+	for (i = 0; i < func->interface_count; ++i) {
+		struct usbf_interface *intf = func->interfaces[i];
+		for (a = 0; a < intf->alt_count; ++a) {
+			struct usbf_alt_setting *alt = intf->alts[a];
+			for (c = 0; c < alt->class_desc_count; ++c) {
+				free(alt->class_descs[c]->data);
+				free(alt->class_descs[c]);
+			}
+			for (e = 0; e < alt->ep_count; ++e)
+				free(alt->endpoints[e]);
+			free(alt);
+		}
+		free(intf);
+	}
 	free(func->ffs_path);
 	free(func);
 }
 
-struct usbf_endpoint *usbf_add_endpoint(
-	struct usbf_function *func, struct usbf_endpoint_descriptor *desc)
+int usbf_set_iad(struct usbf_function *func,
+                 struct usbf_iad_descriptor *desc)
 {
-	struct usbf_endpoint *ep;
+	if (!func || !desc)
+		return -EINVAL;
+	memcpy(&func->iad_desc, desc, sizeof(*desc));
+	func->has_iad = 1;
+	return 0;
+}
 
-	/* TODO - validate maxpacketsize and interval for selected speeds */
+struct usbf_interface *
+usbf_add_interface(struct usbf_function *func,
+                   struct usbf_interface_descriptor *desc)
+{
+	struct usbf_interface *intf;
+
+	if (func->interface_count >= MAX_INTERFACES)
+		return NULL;
+
+	intf = malloc(sizeof(*intf));
+	if (!intf)
+		return NULL;
+
+	memcpy(&intf->desc, desc, sizeof(*desc));
+	intf->alt_count = 0;
+	intf->intf_num = func->interface_count;
+	intf->string_idx = 0;
+	intf->func = func;
+
+	func->interfaces[func->interface_count++] = intf;
+	return intf;
+}
+
+struct usbf_alt_setting *usbf_add_alt_setting(struct usbf_interface *intf)
+{
+	struct usbf_alt_setting *alt;
+
+	if (intf->alt_count >= MAX_ALT_SETTINGS)
+		return NULL;
+
+	alt = malloc(sizeof(*alt));
+	if (!alt)
+		return NULL;
+
+	alt->ep_count = 0;
+	alt->class_desc_count = 0;
+	alt->alt_num = intf->alt_count;
+	alt->intf = intf;
+
+	intf->alts[intf->alt_count++] = alt;
+
+	return alt;
+}
+
+int usbf_add_class_descriptor(struct usbf_alt_setting *alt,
+                              const void *data, size_t length)
+{
+	struct usbf_class_descriptor *cd;
+
+	/* USB descriptors carry their own length in the first byte; the blob
+	 * passed here is one descriptor, so bLength must equal the byte
+	 * count. Single-byte descriptors don't exist (every descriptor type
+	 * has at least bLength + bDescriptorType), and bLength is uint8 so
+	 * 255 bytes is the upper bound. */
+	if (length < 2 || length > 255)
+		return -EINVAL;
+	if (((const uint8_t *)data)[0] != length)
+		return -EINVAL;
+	if (alt->class_desc_count >= MAX_CLASS_DESCS)
+		return -ENOSPC;
+
+	cd = malloc(sizeof(*cd));
+	if (!cd)
+		return -ENOMEM;
+	cd->data = malloc(length);
+	if (!cd->data) {
+		free(cd);
+		return -ENOMEM;
+	}
+	memcpy(cd->data, data, length);
+	cd->length = length;
+
+	alt->class_descs[alt->class_desc_count++] = cd;
+	return 0;
+}
+
+/* Returns the total number of endpoints declared across all interfaces and
+ * their alt-settings. Used to assign sequential ep numbers (FFS allocates one
+ * epfile per declared endpoint, in the order they appear in the descriptors). */
+static int total_ep_count(const struct usbf_function *func)
+{
+	int i, a, n = 0;
+	for (i = 0; i < func->interface_count; ++i) {
+		const struct usbf_interface *intf = func->interfaces[i];
+		for (a = 0; a < intf->alt_count; ++a)
+			n += intf->alts[a]->ep_count;
+	}
+	return n;
+}
+
+/* Validate one (speed, mps, interval) tuple against the USB spec rules
+ * for the endpoint's transfer type. Lower 11 bits of mps are the
+ * per-transaction size; bits 11..12 carry the high-bandwidth multiplier
+ * for HS interrupt/isoc and must be 0 elsewhere. SS encodes burst/mult
+ * in the SS companion descriptor instead, so its mps top bits must be 0
+ * too. */
+static int validate_endpoint_speed(enum usbf_endpoint_type type,
+                                   uint16_t mps, uint8_t interval,
+                                   uint32_t speed)
+{
+	uint16_t size = mps & 0x07ff;
+	uint16_t mult = (mps >> 11) & 0x03;
+
+	switch (type) {
+	case USBF_BULK:
+		if (mult != 0)
+			return -EINVAL;
+		if (speed == USBF_SPEED_FS) {
+			if (size != 8 && size != 16 && size != 32 && size != 64)
+				return -EINVAL;
+		} else if (speed == USBF_SPEED_HS) {
+			if (size != 512)
+				return -EINVAL;
+		} else { /* SS */
+			if (size != 1024)
+				return -EINVAL;
+		}
+		/* bInterval is unused for bulk on FS/SS; HS allows a NAK-rate
+		 * hint in 0..255 which fits uint8_t natively, so nothing to
+		 * check. */
+		break;
+
+	case USBF_INTERRUPT:
+		if (size == 0)
+			return -EINVAL;
+		if (speed == USBF_SPEED_FS) {
+			if (size > 64 || mult != 0)
+				return -EINVAL;
+			if (interval == 0)
+				return -EINVAL;
+			/* FS interrupt bInterval is in frames, 1..255 -
+			 * naturally bounded by uint8_t. */
+		} else if (speed == USBF_SPEED_HS) {
+			if (size > 1024 || mult > 2)
+				return -EINVAL;
+			if (interval == 0 || interval > 16)
+				return -EINVAL;
+		} else { /* SS */
+			if (size > 1024 || mult != 0)
+				return -EINVAL;
+			if (interval == 0 || interval > 16)
+				return -EINVAL;
+		}
+		break;
+
+	case USBF_ISOCHRONOUS:
+		if (speed == USBF_SPEED_FS) {
+			if (size > 1023 || mult != 0)
+				return -EINVAL;
+			if (interval == 0 || interval > 16)
+				return -EINVAL;
+		} else if (speed == USBF_SPEED_HS) {
+			if (size > 1024 || mult > 2)
+				return -EINVAL;
+			if (interval == 0 || interval > 16)
+				return -EINVAL;
+		} else { /* SS */
+			if (size > 1024 || mult != 0)
+				return -EINVAL;
+			if (interval == 0 || interval > 16)
+				return -EINVAL;
+		}
+		break;
+	}
+	return 0;
+}
+
+/* SS endpoint companion descriptor sanity:
+ *   bMaxBurst:           0..15 always.
+ *   bmAttributes:        bulk encodes the max-streams exponent in bits[4:0]
+ *                        (so bits[7:5] are reserved); isoc encodes Mult in
+ *                        bits[1:0] with Mult <= 2 and bits[7:2] reserved;
+ *                        interrupt has the whole byte reserved.
+ *   wBytesPerInterval:   bulk MUST be 0 per spec; periodic eps reserve
+ *                        bandwidth so any non-zero value is allowed. */
+static int validate_ss_companion(enum usbf_endpoint_type type,
+                                 const struct usbf_endpoint_descriptor *desc)
+{
+	if (desc->ss_max_burst > 15)
+		return -EINVAL;
+
+	switch (type) {
+	case USBF_BULK:
+		if (desc->ss_attributes & 0xe0)
+			return -EINVAL;
+		if (desc->ss_bytes_per_interval != 0)
+			return -EINVAL;
+		break;
+	case USBF_INTERRUPT:
+		if (desc->ss_attributes != 0)
+			return -EINVAL;
+		break;
+	case USBF_ISOCHRONOUS:
+		if (desc->ss_attributes & 0xfc)
+			return -EINVAL;
+		if ((desc->ss_attributes & 0x03) > 2)
+			return -EINVAL;
+		break;
+	}
+	return 0;
+}
+
+struct usbf_endpoint *usbf_add_endpoint(
+	struct usbf_alt_setting *alt, struct usbf_endpoint_descriptor *desc)
+{
+	struct usbf_function *func = alt->intf->func;
+	struct usbf_endpoint *ep;
+	int ep_num;
+
 	switch (desc->type) {
 	case USBF_ISOCHRONOUS:
 	case USBF_BULK:
@@ -92,7 +328,32 @@ struct usbf_endpoint *usbf_add_endpoint(
 		return NULL;
 	}
 
-	if (func->ep_count >= MAX_ENDPOINTS)
+	if (desc->direction != USBF_IN && desc->direction != USBF_OUT)
+		return NULL;
+
+	if ((func->desc.speed & USBF_SPEED_FS) &&
+	    validate_endpoint_speed(desc->type,
+	                            desc->fs_maxpacketsize,
+	                            desc->fs_interval, USBF_SPEED_FS) < 0)
+		return NULL;
+	if ((func->desc.speed & USBF_SPEED_HS) &&
+	    validate_endpoint_speed(desc->type,
+	                            desc->hs_maxpacketsize,
+	                            desc->hs_interval, USBF_SPEED_HS) < 0)
+		return NULL;
+	if (func->desc.speed & USBF_SPEED_SS) {
+		if (validate_endpoint_speed(desc->type,
+		                            desc->ss_maxpacketsize,
+		                            desc->ss_interval,
+		                            USBF_SPEED_SS) < 0)
+			return NULL;
+		if (validate_ss_companion(desc->type, desc) < 0)
+			return NULL;
+	}
+
+	if (alt->ep_count >= MAX_ENDPOINTS)
+		return NULL;
+	if (total_ep_count(func) >= MAX_ENDPOINTS)
 		return NULL;
 
 	ep = malloc(sizeof(*ep));
@@ -103,10 +364,75 @@ struct usbf_endpoint *usbf_add_endpoint(
 	ep->func = func;
 	ep->epfile = -1;
 
-	func->endpoints[func->ep_count++] = ep;
-	ep->address = func->ep_count | ep->desc.direction;
+	alt->endpoints[alt->ep_count++] = ep;
+	/* Sequential endpoint number across all interfaces+alts in declaration
+	 * order. */
+	ep_num = total_ep_count(func);
+	ep->address = ep_num | ep->desc.direction;
 
 	return ep;
+}
+
+/* Sum total alt-settings across all interfaces. */
+static int total_alt_count(const struct usbf_function *func)
+{
+	int i, n = 0;
+	for (i = 0; i < func->interface_count; ++i)
+		n += func->interfaces[i]->alt_count;
+	return n;
+}
+
+/* Walk every alt and accumulate class-descriptor counts and byte size. */
+static void total_class_descs(const struct usbf_function *func,
+                              int *out_count, size_t *out_bytes)
+{
+	int i, a, c, count = 0;
+	size_t bytes = 0;
+	for (i = 0; i < func->interface_count; ++i) {
+		const struct usbf_interface *intf = func->interfaces[i];
+		for (a = 0; a < intf->alt_count; ++a) {
+			const struct usbf_alt_setting *alt = intf->alts[a];
+			for (c = 0; c < alt->class_desc_count; ++c) {
+				++count;
+				bytes += alt->class_descs[c]->length;
+			}
+		}
+	}
+	*out_count = count;
+	*out_bytes = bytes;
+}
+
+/* Walk the function and assign 1-based string indices to every descriptor
+ * that supplied a non-empty string (IAD's iFunction, then each interface's
+ * iInterface in declaration order). Returns the number of strings to emit
+ * and the total NUL-included byte length of all strings. Indices are dense
+ * (1, 2, ...) so the kernel's needed_count check (max string idx used) lines
+ * up with str_count. */
+static void assign_string_indices(struct usbf_function *func,
+                                  int *out_count, size_t *out_bytes)
+{
+	int i, idx = 1;
+	size_t bytes = 0;
+
+	if (func->has_iad && func->iad_desc.string &&
+	    func->iad_desc.string[0] != '\0') {
+		func->iad_string_idx = idx++;
+		bytes += strlen(func->iad_desc.string) + 1;
+	} else {
+		func->iad_string_idx = 0;
+	}
+
+	for (i = 0; i < func->interface_count; ++i) {
+		struct usbf_interface *intf = func->interfaces[i];
+		if (intf->desc.string && intf->desc.string[0] != '\0') {
+			intf->string_idx = idx++;
+			bytes += strlen(intf->desc.string) + 1;
+		} else {
+			intf->string_idx = 0;
+		}
+	}
+	*out_count = idx - 1;
+	*out_bytes = bytes;
 }
 
 int usbf_start(struct usbf_function *func)
@@ -118,87 +444,214 @@ int usbf_start(struct usbf_function *func)
 	struct usb_endpoint_descriptor_no_audio *ep_desc;
 	__le32 *count_ptr;
 	struct usb_functionfs_strings_head *strings_header;
+	struct usbf_interface *intf;
+	struct usbf_alt_setting *alt;
 	struct usbf_endpoint *ep;
 	struct epoll_event eev;
 	uint32_t speed;
 	char *path;
-	int ret, i, j;
+	void *cur;
+	int str_count;
+	size_t str_bytes;
+	int ret, i, a, e, k, opened;
 
-	/* We count how many speeds we support */
-	descs.speeds = !!(func->flags & USBF_SPEED_FS) +
-		!!(func->flags & USBF_SPEED_HS) +
-		!!(func->flags & USBF_SPEED_SS);
-	descs.endpoints = func->ep_count;
+	if (func->interface_count == 0)
+		return -EINVAL;
+	for (i = 0; i < func->interface_count; ++i)
+		if (func->interfaces[i]->alt_count == 0)
+			return -EINVAL;
+
+	{
+		int alts = total_alt_count(func);
+		int eps = total_ep_count(func);
+		int n_class;
+		size_t class_bytes;
+		size_t base_size;
+		int base_count;
+		uint32_t s;
+		int idx = 0;
+
+		total_class_descs(func, &n_class, &class_bytes);
+
+		/* All speeds share the same IAD (when set), interface
+		 * descriptors, class descriptors, and endpoint descriptors.
+		 * SS additionally appends a 6-byte SS companion after each
+		 * endpoint. */
+		base_size = alts * sizeof(struct usb_interface_descriptor) +
+			class_bytes +
+			eps * sizeof(struct usb_endpoint_descriptor_no_audio);
+		base_count = alts + n_class + eps;
+		if (func->has_iad) {
+			base_size += sizeof(struct usb_interface_assoc_descriptor);
+			base_count += 1;
+		}
+
+		descs.speeds = !!(func->flags & USBF_SPEED_FS) +
+			!!(func->flags & USBF_SPEED_HS) +
+			!!(func->flags & USBF_SPEED_SS);
+
+		for (s = USBF_SPEED_FS; s <= USBF_SPEED_SS; s <<= 1) {
+			if (!(func->flags & s))
+				continue;
+			descs.per_speed_size[idx] = base_size;
+			descs.per_speed_count[idx] = base_count;
+			if (s == USBF_SPEED_SS) {
+				descs.per_speed_size[idx] += eps *
+					sizeof(struct usb_ss_ep_comp_descriptor);
+				descs.per_speed_count[idx] += eps;
+			}
+			++idx;
+		}
+	}
+
 	ret = __usbf_descs_alloc(&descs);
 	if (ret)
 		return ret;
 
 	descs_header = __usbf_descs_access_header(&descs);
 	descs_header->magic = htole32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2);
-	/* Our speed flags has the same value as in FunctionFS */
-	descs_header->flags = htole32(func->flags);
+	{
+		/* Our speed flags has the same value as in FunctionFS;
+		 * usbf_function_flags map to their FFS counterparts here. */
+		uint32_t ffs_flags = func->flags;
+		if (func->desc.flags & USBF_ALL_CTRL_RECIP)
+			ffs_flags |= FUNCTIONFS_ALL_CTRL_RECIP;
+		descs_header->flags = htole32(ffs_flags);
+	}
 	descs_header->length = htole32(descs.length);
 
 	for (i = 0; i < descs.speeds; ++i) {
 		count_ptr = __usbf_descs_access_count(&descs, i);
-		*count_ptr = htole32(descs.endpoints + 1);
+		*count_ptr = htole32(descs.per_speed_count[i]);
 	}
 
+	/* String indices must be assigned before descriptor emission so each
+	 * interface descriptor can reference its iInterface slot. */
+	assign_string_indices(func, &str_count, &str_bytes);
+
 	speed = 1;
-	for (i = 0; i < descs.speeds; ++i) {
+	for (k = 0; k < descs.speeds; ++k) {
 		while (!(speed & func->flags))
 			speed <<= 1;
-		intf_desc = __usbf_descs_access_interface(&descs, i);
-		intf_desc->bLength = sizeof(*intf_desc);
-		intf_desc->bDescriptorType = USB_DT_INTERFACE;
-		intf_desc->bNumEndpoints = descs.endpoints;
-		intf_desc->bInterfaceClass = func->desc.interface_class;
-		intf_desc->iInterface = 1;
-		for (j = 0; j < descs.endpoints; ++j) {
-			ep = func->endpoints[j];
-			ep_desc = __usbf_descs_access_endpoint(&descs, i, j);
-			ep_desc->bLength = sizeof(*ep_desc);
-			ep_desc->bDescriptorType = USB_DT_ENDPOINT;
-			ep_desc->bEndpointAddress = ep->address;
-			ep_desc->bmAttributes = ep->desc.type;
-			switch (speed) {
-			case USBF_SPEED_FS:
-				ep_desc->wMaxPacketSize =
-					htole16(ep->desc.fs_maxpacketsize);
-				ep_desc->bInterval = ep->desc.fs_interval;
-				break;
-			case USBF_SPEED_HS:
-				ep_desc->wMaxPacketSize =
-					htole16(ep->desc.hs_maxpacketsize);
-				ep_desc->bInterval = ep->desc.hs_interval;
-				break;
-			case USBF_SPEED_SS:
-				ep_desc->wMaxPacketSize =
-					htole16(ep->desc.ss_maxpacketsize);
-				ep_desc->bInterval = ep->desc.ss_interval;
-				break;
+		cur = __usbf_descs_access_speed_block(&descs, k);
+		if (func->has_iad) {
+			struct usb_interface_assoc_descriptor *iad = cur;
+			iad->bLength = sizeof(*iad);
+			iad->bDescriptorType = USB_DT_INTERFACE_ASSOCIATION;
+			iad->bFirstInterface = 0;
+			iad->bInterfaceCount = func->interface_count;
+			iad->bFunctionClass = func->iad_desc.function_class;
+			iad->bFunctionSubClass = func->iad_desc.function_subclass;
+			iad->bFunctionProtocol = func->iad_desc.function_protocol;
+			iad->iFunction = func->iad_string_idx;
+			cur += sizeof(*iad);
+		}
+		for (i = 0; i < func->interface_count; ++i) {
+			intf = func->interfaces[i];
+			for (a = 0; a < intf->alt_count; ++a) {
+				int c;
+				alt = intf->alts[a];
+				intf_desc = cur;
+				intf_desc->bLength = sizeof(*intf_desc);
+				intf_desc->bDescriptorType = USB_DT_INTERFACE;
+				intf_desc->bInterfaceNumber = intf->intf_num;
+				intf_desc->bAlternateSetting = alt->alt_num;
+				intf_desc->bNumEndpoints = alt->ep_count;
+				intf_desc->bInterfaceClass =
+					intf->desc.interface_class;
+				intf_desc->bInterfaceSubClass =
+					intf->desc.interface_subclass;
+				intf_desc->bInterfaceProtocol =
+					intf->desc.interface_protocol;
+				intf_desc->iInterface = intf->string_idx;
+				cur += sizeof(*intf_desc);
+				/* Class-specific descriptors (e.g. HID, CCID,
+				 * DFU functional) sit between the interface
+				 * descriptor and its endpoint descriptors. */
+				for (c = 0; c < alt->class_desc_count; ++c) {
+					struct usbf_class_descriptor *cd =
+						alt->class_descs[c];
+					memcpy(cur, cd->data, cd->length);
+					cur += cd->length;
+				}
+				for (e = 0; e < alt->ep_count; ++e) {
+					ep = alt->endpoints[e];
+					ep_desc = cur;
+					ep_desc->bLength = sizeof(*ep_desc);
+					ep_desc->bDescriptorType = USB_DT_ENDPOINT;
+					ep_desc->bEndpointAddress = ep->address;
+					ep_desc->bmAttributes = ep->desc.type;
+					switch (speed) {
+					case USBF_SPEED_FS:
+						ep_desc->wMaxPacketSize =
+							htole16(ep->desc.fs_maxpacketsize);
+						ep_desc->bInterval = ep->desc.fs_interval;
+						break;
+					case USBF_SPEED_HS:
+						ep_desc->wMaxPacketSize =
+							htole16(ep->desc.hs_maxpacketsize);
+						ep_desc->bInterval = ep->desc.hs_interval;
+						break;
+					case USBF_SPEED_SS:
+						ep_desc->wMaxPacketSize =
+							htole16(ep->desc.ss_maxpacketsize);
+						ep_desc->bInterval = ep->desc.ss_interval;
+						break;
+					}
+					cur += sizeof(*ep_desc);
+					/* SS companion follows every endpoint
+					 * descriptor in the SS speed block. */
+					if (speed == USBF_SPEED_SS) {
+						struct usb_ss_ep_comp_descriptor *comp = cur;
+						comp->bLength = sizeof(*comp);
+						comp->bDescriptorType = USB_DT_SS_ENDPOINT_COMP;
+						comp->bMaxBurst = ep->desc.ss_max_burst;
+						comp->bmAttributes = ep->desc.ss_attributes;
+						comp->wBytesPerInterval =
+							htole16(ep->desc.ss_bytes_per_interval);
+						cur += sizeof(*comp);
+					}
+				}
 			}
 		}
 		speed <<= 1;
 	}
 
-	/* Single en_US (LangID 0x0409) interface string. The strings table
-	 * format supports multiple LangIDs and multiple strings per LangID;
-	 * generalizing this requires extending usbf_function_descriptor and
-	 * the __usbf_strings layout. No current consumer needs it. */
-	strings.str_length = strlen(func->desc.string);
+	/* Strings table: one LangID (en-US 0x0409) with str_count strings
+	 * (one per interface that supplied a non-empty string). When no
+	 * interface declared a string, str_count == 0 and the body is empty;
+	 * FFS accepts that as long as no descriptor references a string. */
+	if (str_count > 0)
+		strings.body_length = sizeof(__le16) + str_bytes;
+	else
+		strings.body_length = 0;
+	strings.str_count = str_count;
 	ret = __usbf_strings_alloc(&strings);
 	if (ret < 0)
 		goto out;
 
 	strings_header = __usbf_strings_access_header(&strings);
 	strings_header->magic = htole32(FUNCTIONFS_STRINGS_MAGIC);
-	strings_header->length = strings.length;
-	strings_header->str_count = htole32(1);
-	strings_header->lang_count = htole32(1);
+	strings_header->length = htole32(strings.length);
+	strings_header->str_count = htole32(str_count);
+	strings_header->lang_count = htole32(str_count > 0 ? 1 : 0);
 
-	__usbf_strings_set_code(&strings, htole16(0x0409));
-	__usbf_strings_set_string(&strings, func->desc.string);
+	if (str_count > 0) {
+		char *body = __usbf_strings_body(&strings);
+		*(__le16 *)body = htole16(0x0409);
+		body += sizeof(__le16);
+		if (func->iad_string_idx != 0) {
+			strcpy(body, func->iad_desc.string);
+			body += strlen(func->iad_desc.string) + 1;
+		}
+		for (i = 0; i < func->interface_count; ++i) {
+			struct usbf_interface *p = func->interfaces[i];
+			if (p->string_idx == 0)
+				continue;
+			strcpy(body, p->desc.string);
+			body += strlen(p->desc.string) + 1;
+		}
+	}
 
 	/* We need space for 6 chars - 5 for "/ep##" and 1 for '\0' */
 	path = malloc(strlen(func->ffs_path) + 6);
@@ -222,12 +675,20 @@ int usbf_start(struct usbf_function *func)
 	if (ret < 0)
 		goto err;
 
-	for (i = 0; i < func->ep_count; ++i) {
-		sprintf(path, "%s/ep%d", func->ffs_path, i + 1);
-		func->endpoints[i]->epfile = open(path, O_RDWR);
-		if (func->endpoints[i]->epfile < 0) {
-			ret = func->endpoints[i]->epfile;
-			goto err_epfiles;
+	opened = 0;
+	for (i = 0; i < func->interface_count; ++i) {
+		intf = func->interfaces[i];
+		for (a = 0; a < intf->alt_count; ++a) {
+			alt = intf->alts[a];
+			for (e = 0; e < alt->ep_count; ++e) {
+				sprintf(path, "%s/ep%d", func->ffs_path, opened + 1);
+				alt->endpoints[e]->epfile = open(path, O_RDWR);
+				if (alt->endpoints[e]->epfile < 0) {
+					ret = alt->endpoints[e]->epfile;
+					goto err_epfiles;
+				}
+				++opened;
+			}
 		}
 	}
 
@@ -274,8 +735,17 @@ err_aio:
 	io_destroy(func->aio_ctx);
 	func->aio_ctx = 0;
 err_epfiles:
-	while (i)
-		close(func->endpoints[--i]->epfile);
+	for (i = 0; i < func->interface_count && opened > 0; ++i) {
+		intf = func->interfaces[i];
+		for (a = 0; a < intf->alt_count && opened > 0; ++a) {
+			alt = intf->alts[a];
+			for (e = 0; e < alt->ep_count && opened > 0; ++e) {
+				close(alt->endpoints[e]->epfile);
+				alt->endpoints[e]->epfile = -1;
+				--opened;
+			}
+		}
+	}
 err:
 	close(func->ep0_file);
 	func->ep0_file = -1;
@@ -290,7 +760,7 @@ out:
 
 void usbf_stop(struct usbf_function *func)
 {
-	int i;
+	int i, a, e;
 
 	func->running = 0;
 
@@ -307,10 +777,16 @@ void usbf_stop(struct usbf_function *func)
 		func->aio_ctx = 0;
 	}
 
-	for (i = 0; i < func->ep_count; ++i) {
-		if (func->endpoints[i]->epfile >= 0) {
-			close(func->endpoints[i]->epfile);
-			func->endpoints[i]->epfile = -1;
+	for (i = 0; i < func->interface_count; ++i) {
+		struct usbf_interface *intf = func->interfaces[i];
+		for (a = 0; a < intf->alt_count; ++a) {
+			struct usbf_alt_setting *alt = intf->alts[a];
+			for (e = 0; e < alt->ep_count; ++e) {
+				if (alt->endpoints[e]->epfile >= 0) {
+					close(alt->endpoints[e]->epfile);
+					alt->endpoints[e]->epfile = -1;
+				}
+			}
 		}
 	}
 	if (func->ep0_file >= 0) {
@@ -360,12 +836,150 @@ int usbf_submit(struct usbf_endpoint *ep, void *data, size_t length,
 			ret = -EAGAIN;
 		goto err;
 	}
+	uio->in_flight = 1;
 	return 0;
 
 err:
 	uio->next_free = func->free_iocb;
 	func->free_iocb = uio;
 	return ret;
+}
+
+static int cancel_iocbs(struct usbf_function *func, struct usbf_endpoint *match)
+{
+	struct io_event ev;
+	int i, count = 0;
+
+	for (i = 0; i < MAX_INFLIGHT; ++i) {
+		struct usbf_iocb *uio = &func->iocb_pool[i];
+		int ret;
+
+		if (!uio->in_flight)
+			continue;
+		if (match && uio->ep != match)
+			continue;
+
+		ret = io_cancel(func->aio_ctx, &uio->cb, &ev);
+		/* Modern kernels return -EINPROGRESS to mean "cancellation
+		 * initiated; the result will be delivered via the ring
+		 * buffer". Older interfaces returned 0 with `ev` populated.
+		 * Either way the iocb counts as canceled; drain_completions
+		 * below fires the user callback once the kernel posts the
+		 * event. */
+		if (ret == 0 || ret == -EINPROGRESS)
+			count++;
+	}
+
+	drain_completions(func);
+	return count;
+}
+
+int usbf_cancel(struct usbf_endpoint *ep)
+{
+	return cancel_iocbs(ep->func, ep);
+}
+
+int usbf_cancel_all(struct usbf_function *func)
+{
+	return cancel_iocbs(func, NULL);
+}
+
+int usbf_halt(struct usbf_endpoint *ep)
+{
+	ssize_t r;
+
+	/* Wrong-direction zero-length transfer signals halt to FFS, mirroring
+	 * the ep0 stall trick: read on an IN ep or write on an OUT ep makes
+	 * the kernel call usb_ep_set_halt() and return -EBADMSG via errno. */
+	if (ep->desc.direction == USBF_IN)
+		r = read(ep->epfile, NULL, 0);
+	else
+		r = write(ep->epfile, NULL, 0);
+	if (r < 0 && errno != EBADMSG)
+		return -errno;
+	return 0;
+}
+
+int usbf_clear_halt(struct usbf_endpoint *ep)
+{
+	if (ioctl(ep->epfile, FUNCTIONFS_CLEAR_HALT) < 0)
+		return -errno;
+	return 0;
+}
+
+struct usbf_endpoint *
+usbf_find_endpoint(struct usbf_function *func, uint8_t number)
+{
+	int i, a, e;
+
+	for (i = 0; i < func->interface_count; ++i) {
+		struct usbf_interface *intf = func->interfaces[i];
+		for (a = 0; a < intf->alt_count; ++a) {
+			struct usbf_alt_setting *alt = intf->alts[a];
+			for (e = 0; e < alt->ep_count; ++e) {
+				struct usbf_endpoint *ep = alt->endpoints[e];
+				if ((ep->address & 0x7f) == number)
+					return ep;
+			}
+		}
+	}
+	return NULL;
+}
+
+static int parse_udc_speed(const char *s)
+{
+	if (!strcmp(s, "low-speed") || !strcmp(s, "full-speed"))
+		return USBF_SPEED_FS;
+	if (!strcmp(s, "high-speed"))
+		return USBF_SPEED_HS;
+	if (!strcmp(s, "super-speed") || !strcmp(s, "super-speed-plus"))
+		return USBF_SPEED_SS;
+	return 0;
+}
+
+int usbf_get_speed(struct usbf_function *func)
+{
+	DIR *dir;
+	struct dirent *ent;
+	int found = 0;
+	int speed = 0;
+
+	(void)func;
+
+	dir = opendir("/sys/class/udc");
+	if (!dir)
+		return 0;
+
+	while ((ent = readdir(dir)) != NULL) {
+		char path[PATH_MAX];
+		char buf[32];
+		int fd, n, s;
+
+		if (ent->d_name[0] == '.')
+			continue;
+
+		snprintf(path, sizeof(path),
+			 "/sys/class/udc/%s/current_speed", ent->d_name);
+		fd = open(path, O_RDONLY);
+		if (fd < 0)
+			continue;
+		n = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n <= 0)
+			continue;
+		while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == ' '))
+			--n;
+		buf[n] = '\0';
+
+		s = parse_udc_speed(buf);
+		if (s != 0) {
+			++found;
+			speed = s;
+		}
+	}
+	closedir(dir);
+
+	return found == 1 ? speed : 0;
 }
 
 static int drain_ep0_events(struct usbf_function *func)
@@ -442,6 +1056,7 @@ static int drain_completions(struct usbf_function *func)
 
 		for (i = 0; i < got; ++i) {
 			uio = (struct usbf_iocb *)ev[i].obj;
+			uio->in_flight = 0;
 			if (uio->complete)
 				uio->complete(uio->ep, uio->data, uio->length,
 				              ev[i].res, uio->user);

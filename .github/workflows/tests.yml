@@ -1,0 +1,57 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build and test dependencies
+        run: |
+          # The Azure kernel doesn't build dummy_hcd; we build it out-of-tree
+          # against the running kernel's headers. linux-modules-extra-* gives
+          # us libcomposite/configfs/functionfs which the suite also needs.
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake libtool pkg-config \
+            build-essential \
+            libaio-dev \
+            libusb-1.0-0-dev \
+            python3-pytest python3-usb \
+            "linux-headers-$(uname -r)" \
+            "linux-modules-extra-$(uname -r)"
+
+      - name: Build and install dummy_hcd
+        run: |
+          # dummy_hcd.c is upstream test code; Canonical doesn't patch it
+          # in the Azure tree, so pulling v<major.minor> from kernel.org
+          # is equivalent to (and more reliable than) Launchpad's cgit.
+          tag="v$(uname -r | cut -d. -f1,2)"
+          base="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain"
+          mkdir -p /tmp/dummy_hcd/build && cd /tmp/dummy_hcd/build
+          curl -fsSL --retry 3 --retry-delay 5 -o dummy_hcd.c \
+            "${base}/drivers/usb/gadget/udc/dummy_hcd.c?h=${tag}"
+          echo 'obj-m := dummy_hcd.o' > Makefile
+          make -C "/lib/modules/$(uname -r)/build" M="$PWD" modules
+          sudo install -D dummy_hcd.ko \
+            "/lib/modules/$(uname -r)/kernel/drivers/usb/gadget/udc/dummy_hcd.ko"
+          sudo depmod -a
+
+      - name: Build libusbf
+        run: |
+          ./autogen.sh
+          ./configure
+          make
+
+      - name: Build test gadgets
+        run: make -C tests/gadgets
+
+      - name: Run pytest
+        working-directory: tests
+        run: sudo python3 -m pytest -v

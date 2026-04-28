@@ -45,6 +45,37 @@ DUMMY_HCD_SPEED_ARGS = {
 UDC_APPEAR_TIMEOUT_S = 5
 
 
+def _wait_for_udc() -> None:
+    deadline = time.monotonic() + UDC_APPEAR_TIMEOUT_S
+    while not DEFAULT_UDC_SYSFS.exists():
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                f"{DEFAULT_UDC_SYSFS} didn't appear after loading dummy_hcd")
+        time.sleep(0.05)
+
+
+def _reload_dummy_hcd(args=()) -> None:
+    subprocess.run(["rmmod", "dummy_hcd"], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["modprobe", "dummy_hcd", *args], check=True)
+    _wait_for_udc()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _ensure_dummy_hcd():
+    """Make sure dummy_hcd is loaded before any test runs.
+
+    Idempotent: if the module is already loaded (UDC sysfs entry present) we
+    leave it alone, so a developer who loaded it manually keeps their state.
+    The dummy_hcd_speed fixture independently rmmod/modprobe's the module to
+    change its parameters - this just covers the case where nobody loaded it
+    yet (e.g. CI).
+    """
+    if not DEFAULT_UDC_SYSFS.exists():
+        subprocess.run(["modprobe", "dummy_hcd"], check=True)
+        _wait_for_udc()
+
+
 def udc_max_speed() -> str:
     """Return the UDC's maximum_speed sysfs attribute.
 
@@ -106,25 +137,12 @@ def dummy_hcd_speed(request):
             f"unknown dummy_hcd_speed {desired!r} (valid: "
             f"{sorted(DUMMY_HCD_SPEED_ARGS)})")
 
-    subprocess.run(["rmmod", "dummy_hcd"], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["modprobe", "dummy_hcd"] + DUMMY_HCD_SPEED_ARGS[desired],
-                   check=True)
-
-    deadline = time.monotonic() + UDC_APPEAR_TIMEOUT_S
-    while not DEFAULT_UDC_SYSFS.exists():
-        if time.monotonic() >= deadline:
-            pytest.fail(
-                f"dummy_udc.0 didn't appear after modprobe dummy_hcd "
-                f"{' '.join(DUMMY_HCD_SPEED_ARGS[desired])}")
-        time.sleep(0.05)
+    _reload_dummy_hcd(DUMMY_HCD_SPEED_ARGS[desired])
 
     try:
         yield desired
     finally:
-        subprocess.run(["rmmod", "dummy_hcd"], check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["modprobe", "dummy_hcd"], check=False)
+        _reload_dummy_hcd()
 
 
 @pytest.fixture

@@ -105,8 +105,8 @@ exercises them over libusb from the host - no real hardware required.  See
 
 ## Maintainer
 
-[Robert Baldyga](https://github.com/robertbaldyga).  Bug reports, patches,
-and questions go through GitHub issues and pull requests.
+The maintainer of this project is [Robert Baldyga](https://github.com/robertbaldyga).
+Bug reports, patches, and questions should go through GitHub issues and pull requests.
 
 ## License
 

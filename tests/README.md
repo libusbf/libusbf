@@ -53,7 +53,12 @@ per test for the isolation.
 | `all_ctrl_recip`       | 1 intf, no eps; vendor/Device ep0 loopback             | `test_all_ctrl_recip.py`   | USBF_ALL_CTRL_RECIP forwards Device-recipient ctrl |
 | `speed_query`          | 1 intf, no eps; vendor IN returns usbf_get_speed result | `test_speed.py`           | usbf_get_speed across FS/HS/SS |
 
-More to come (isoc).
+## Isochronous endpoints
+
+`dummy_hcd` does not implement isochronous transfers, so iso endpoints
+cannot be exercised by this suite.  libusbf supports them, but they need
+real hardware to test - run a gadget that declares iso endpoints against
+a UDC backed by an actual USB controller.
 
 ## Per-test UDC speed
 

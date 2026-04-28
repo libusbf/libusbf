@@ -20,11 +20,24 @@
 #include <sys/ioctl.h>
 #include <dirent.h>
 
-/* epoll .data.u32 tags for the two fds we watch */
-#define TAG_EP0	0
-#define TAG_AIO	1
+/* epoll .data.u32 tags for the fds we watch */
+#define TAG_EP0		0
+#define TAG_AIO		1
+#define TAG_STOP	2
 
 static int drain_completions(struct usbf_function *func);
+
+static void init_iocb_pool(struct usbf_function *func)
+{
+	int i;
+
+	func->free_iocb = &func->iocb_pool[0];
+	for (i = 0; i < MAX_INFLIGHT; ++i) {
+		func->iocb_pool[i].in_flight = 0;
+		func->iocb_pool[i].next_free = (i < MAX_INFLIGHT - 1)
+			? &func->iocb_pool[i + 1] : NULL;
+	}
+}
 
 struct usbf_function *
 usbf_create_function(struct usbf_function_descriptor *desc, char *path)
@@ -32,7 +45,6 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 	const uint32_t speed_mask = USBF_SPEED_FS | USBF_SPEED_HS | USBF_SPEED_SS;
 	const uint32_t flags_mask = USBF_ALL_CTRL_RECIP;
 	struct usbf_function *func;
-	int i;
 
 	if (!desc || !path)
 		return NULL;
@@ -57,23 +69,16 @@ usbf_create_function(struct usbf_function_descriptor *desc, char *path)
 	strcpy(func->ffs_path, path);
 	memcpy(&func->desc, desc, sizeof(*desc));
 
-	func->flags = func->desc.speed;
+	func->speed_mask = func->desc.speed;
 	func->interface_count = 0;
 	func->has_iad = 0;
 	func->iad_string_idx = 0;
 	func->ep0_file = -1;
 	func->epoll_fd = -1;
 	func->event_fd = -1;
+	func->stop_fd = -1;
 	func->aio_ctx = 0;
 	func->running = 0;
-
-	/* Build the free list linking every iocb slot. */
-	func->free_iocb = &func->iocb_pool[0];
-	for (i = 0; i < MAX_INFLIGHT; ++i) {
-		func->iocb_pool[i].in_flight = 0;
-		func->iocb_pool[i].next_free = (i < MAX_INFLIGHT - 1)
-			? &func->iocb_pool[i + 1] : NULL;
-	}
 
 	return func;
 }
@@ -461,6 +466,8 @@ int usbf_start(struct usbf_function *func)
 		if (func->interfaces[i]->alt_count == 0)
 			return -EINVAL;
 
+	init_iocb_pool(func);
+
 	{
 		int alts = total_alt_count(func);
 		int eps = total_ep_count(func);
@@ -486,12 +493,12 @@ int usbf_start(struct usbf_function *func)
 			base_count += 1;
 		}
 
-		descs.speeds = !!(func->flags & USBF_SPEED_FS) +
-			!!(func->flags & USBF_SPEED_HS) +
-			!!(func->flags & USBF_SPEED_SS);
+		descs.speeds = !!(func->speed_mask & USBF_SPEED_FS) +
+			!!(func->speed_mask & USBF_SPEED_HS) +
+			!!(func->speed_mask & USBF_SPEED_SS);
 
 		for (s = USBF_SPEED_FS; s <= USBF_SPEED_SS; s <<= 1) {
-			if (!(func->flags & s))
+			if (!(func->speed_mask & s))
 				continue;
 			descs.per_speed_size[idx] = base_size;
 			descs.per_speed_count[idx] = base_count;
@@ -511,9 +518,10 @@ int usbf_start(struct usbf_function *func)
 	descs_header = __usbf_descs_access_header(&descs);
 	descs_header->magic = htole32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2);
 	{
-		/* Our speed flags has the same value as in FunctionFS;
-		 * usbf_function_flags map to their FFS counterparts here. */
-		uint32_t ffs_flags = func->flags;
+		/* Speed bits and FFS flag bits share the same wire format,
+		 * so seed ffs_flags with the speed mask and OR in any
+		 * usbf_function_flags that have an FFS counterpart. */
+		uint32_t ffs_flags = func->speed_mask;
 		if (func->desc.flags & USBF_ALL_CTRL_RECIP)
 			ffs_flags |= FUNCTIONFS_ALL_CTRL_RECIP;
 		descs_header->flags = htole32(ffs_flags);
@@ -531,7 +539,7 @@ int usbf_start(struct usbf_function *func)
 
 	speed = 1;
 	for (k = 0; k < descs.speeds; ++k) {
-		while (!(speed & func->flags))
+		while (!(speed & func->speed_mask))
 			speed <<= 1;
 		cur = __usbf_descs_access_speed_block(&descs, k);
 		if (func->has_iad) {
@@ -704,10 +712,16 @@ int usbf_start(struct usbf_function *func)
 		goto err_aio;
 	}
 
+	func->stop_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (func->stop_fd < 0) {
+		ret = -errno;
+		goto err_eventfd;
+	}
+
 	func->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
 	if (func->epoll_fd < 0) {
 		ret = -errno;
-		goto err_eventfd;
+		goto err_stopfd;
 	}
 
 	eev.events = EPOLLIN;
@@ -721,6 +735,11 @@ int usbf_start(struct usbf_function *func)
 		ret = -errno;
 		goto err_epoll;
 	}
+	eev.data.u32 = TAG_STOP;
+	if (epoll_ctl(func->epoll_fd, EPOLL_CTL_ADD, func->stop_fd, &eev) < 0) {
+		ret = -errno;
+		goto err_epoll;
+	}
 
 	ret = 0;
 	goto out3;
@@ -728,6 +747,9 @@ int usbf_start(struct usbf_function *func)
 err_epoll:
 	close(func->epoll_fd);
 	func->epoll_fd = -1;
+err_stopfd:
+	close(func->stop_fd);
+	func->stop_fd = -1;
 err_eventfd:
 	close(func->event_fd);
 	func->event_fd = -1;
@@ -764,9 +786,23 @@ void usbf_stop(struct usbf_function *func)
 
 	func->running = 0;
 
+	/* Wake epoll_wait if usbf_run is mid-loop, so it sees running == 0
+	 * and exits instead of blocking forever. */
+	if (func->stop_fd >= 0) {
+		uint64_t one = 1;
+		ssize_t r;
+		do {
+			r = write(func->stop_fd, &one, sizeof(one));
+		} while (r < 0 && errno == EINTR);
+	}
+
 	if (func->epoll_fd >= 0) {
 		close(func->epoll_fd);
 		func->epoll_fd = -1;
+	}
+	if (func->stop_fd >= 0) {
+		close(func->stop_fd);
+		func->stop_fd = -1;
 	}
 	if (func->event_fd >= 0) {
 		close(func->event_fd);
@@ -1090,6 +1126,8 @@ int usbf_dispatch(struct usbf_function *func)
 			if (ret < 0)
 				return ret;
 		}
+		/* TAG_STOP is only used to wake usbf_run; for an
+		 * external loop, the eventfd just goes unread. */
 	}
 	return 0;
 }
@@ -1108,6 +1146,10 @@ int usbf_run(struct usbf_function *func)
 			return -errno;
 		}
 		for (i = 0; i < n; ++i) {
+			/* If a callback called usbf_stop, skip remaining
+			 * events: their fds may already be closed. */
+			if (!func->running)
+				break;
 			if (events[i].data.u32 == TAG_EP0) {
 				ret = drain_ep0_events(func);
 				if (ret)

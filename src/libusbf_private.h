@@ -67,7 +67,7 @@ struct usbf_interface {
 struct usbf_function {
 	struct usbf_function_descriptor desc;
 	char *ffs_path;
-	uint32_t flags;
+	uint32_t speed_mask;
 	struct usbf_interface *interfaces[MAX_INTERFACES];
 	int interface_count;
 	struct usbf_iad_descriptor iad_desc;
@@ -78,6 +78,7 @@ struct usbf_function {
 	/* Event loop state, valid between usbf_start and usbf_stop. */
 	int epoll_fd;
 	int event_fd;
+	int stop_fd;
 	io_context_t aio_ctx;
 	int running;
 
